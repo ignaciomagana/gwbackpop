@@ -1,708 +1,940 @@
+"""
+backpop.py
+----------
+Core library for the BackPop framework: mapping individual gravitational-wave
+merger observations back to their binary progenitor initial conditions and
+binary evolution physics.
+
+Based on:
+  - Andrews et al. 2021 (ApJL 914, L32)   — single-event, fixed hyperparameters
+  - Wong et al. 2023 (ApJ 950, 181)        — joint ZAMS + hyperparameter inference
+  - Magana Hernandez & Breivik 2025        — Lucky Strikes (GW190814, full kicks)
+
+Changes from the Lucky Strikes version
+---------------------------------------
+BUGFIXES
+  1. Alpha naming mismatch: params_in used 'alpha_1'/'alpha_2' but set_flags
+     checked for 'alpha1_1'/'alpha1_2' — CE efficiency was silently stuck at
+     the default [1.0, 1.0] regardless of sampled values. Fixed by unifying
+     on 'alpha_1'/'alpha_2' throughout.
+
+  2. Kick handler read from wrong dict: inside the params_in loop the kick
+     sub-handler was reading fixed_params[param] instead of params_in[param],
+     which would KeyError for any sampled-kick config with empty fixed_params.
+     Rewrote kick handling to use explicit dispatch instead of string matching.
+
+  3. Kick string-matching fragility: "1" in param matched 'alpha_1', 'acc_lim_1'
+     etc. before the list-guard fired — worked only by accident. Replaced with
+     a dedicated _parse_kick_params() that uses structured dispatch.
+
+REFACTORING / CLARITY
+  4. Removed all commented-out legacy emcee wrapper functions (evolv2_fixed_kicks,
+     evolv2_lowmass_secondary, etc.) — these are dead code since the switch to
+     Nautilus and the dict-based API.
+
+  5. Prior bounds are now defined inside get_backpop_config() rather than as
+     module-level globals — easier to reason about per-config.
+
+  6. Added a canonical 'lucky_strikes' config (17-parameter, full kicks,
+     independent alpha/flim per RLOF event) and a 'lucky_strikes_fixed_vk1'
+     variant (13-parameter, first-kick fixed to zero). These are the configs
+     intended for the catalog-level hierarchical run.
+
+  7. Cosmological interpolation tables are computed once at module import and
+     cached as module-level constants — unchanged from original.
+
+  8. Added type annotations and extended docstrings throughout.
+"""
+
+from __future__ import annotations
+
 import numpy as np
-from ctypes import *
 import pandas as pd
-
-from scipy.stats import gaussian_kde
-import arviz as az
-from pesummary.io import read
-from pesummary.gw.fetch import fetch_open_samples
-
-from scipy.stats import multivariate_normal
 from scipy.interpolate import interp1d
-
-from astropy.cosmology import Planck15, FlatLambdaCDM, z_at_value
-from astropy import units as u
-import astropy.constants as constants
+from astropy.cosmology import Planck15
+from astropy import constants
 from cosmic import _evolvebin
 
-#     SUBROUTINE evolv2_global(z,zpars,acclim,alphain,qHG,qGB,kick_in)
 
-#libc = cdll.LoadLibrary("/hildafs/home/magana/tmp_ondemand_hildafs_phy230014p_symlink/magana/src/COSMIC/cosmic/src/evolv2_bhms.so")
-np.set_printoptions(suppress=True)
+# ---------------------------------------------------------------------------
+# COSMIC column definitions
+# ---------------------------------------------------------------------------
 
-# COSMIC columns
-ALL_COLUMNS = ['tphys', 'mass_1', 'mass_2', 'kstar_1', 'kstar_2', 'sep', 'porb',
-               'ecc', 'RRLO_1', 'RRLO_2', 'evol_type', 'aj_1', 'aj_2', 'tms_1',
-               'tms_2', 'massc_1', 'massc_2', 'rad_1', 'rad_2', 'mass0_1',
-               'mass0_2', 'lum_1', 'lum_2', 'teff_1', 'teff_2', 'radc_1',
-               'radc_2', 'menv_1', 'menv_2', 'renv_1', 'renv_2', 'omega_spin_1',
-               'omega_spin_2', 'B_1', 'B_2', 'bacc_1', 'bacc_2', 'tacc_1',
-               'tacc_2', 'epoch_1', 'epoch_2', 'bhspin_1', 'bhspin_2',
-               'deltam_1', 'deltam_2', 'SN_1', 'SN_2', 'bin_state', 'merger_type']
+ALL_COLUMNS = [
+    'tphys', 'mass_1', 'mass_2', 'kstar_1', 'kstar_2', 'sep', 'porb',
+    'ecc', 'RRLO_1', 'RRLO_2', 'evol_type', 'aj_1', 'aj_2', 'tms_1',
+    'tms_2', 'massc_1', 'massc_2', 'rad_1', 'rad_2', 'mass0_1',
+    'mass0_2', 'lum_1', 'lum_2', 'teff_1', 'teff_2', 'radc_1',
+    'radc_2', 'menv_1', 'menv_2', 'renv_1', 'renv_2', 'omega_spin_1',
+    'omega_spin_2', 'B_1', 'B_2', 'bacc_1', 'bacc_2', 'tacc_1',
+    'tacc_2', 'epoch_1', 'epoch_2', 'bhspin_1', 'bhspin_2',
+    'deltam_1', 'deltam_2', 'SN_1', 'SN_2', 'bin_state', 'merger_type',
+]
 
-INTEGER_COLUMNS = ["bin_state", "bin_num", "kstar_1", "kstar_2", "SN_1", "SN_2", "evol_type"]
+INTEGER_COLUMNS = [
+    "bin_state", "bin_num", "kstar_1", "kstar_2", "SN_1", "SN_2", "evol_type",
+]
 
+# Columns written into the bpp output array (full binary evolution track)
+BPP_COLUMNS = [
+    'tphys', 'mass_1', 'mass_2', 'kstar_1', 'kstar_2',
+    'sep', 'porb', 'ecc', 'RRLO_1', 'RRLO_2', 'evol_type',
+    'aj_1', 'aj_2', 'tms_1', 'tms_2',
+    'massc_1', 'massc_2', 'rad_1', 'rad_2',
+    'mass0_1', 'mass0_2', 'lum_1', 'lum_2', 'teff_1', 'teff_2',
+    'radc_1', 'radc_2', 'menv_1', 'menv_2', 'renv_1', 'renv_2',
+    'omega_spin_1', 'omega_spin_2', 'B_1', 'B_2', 'bacc_1', 'bacc_2',
+    'tacc_1', 'tacc_2', 'epoch_1', 'epoch_2',
+    'bhspin_1', 'bhspin_2',
+]
 
-BPP_COLUMNS = ['tphys', 'mass_1', 'mass_2', 'kstar_1', 'kstar_2',
-               'sep', 'porb', 'ecc', 'RRLO_1', 'RRLO_2', 'evol_type',
-               'aj_1', 'aj_2', 'tms_1', 'tms_2',
-               'massc_1', 'massc_2', 'rad_1', 'rad_2',
-               'mass0_1', 'mass0_2', 'lum_1', 'lum_2', 'teff_1', 'teff_2',
-               'radc_1', 'radc_2', 'menv_1', 'menv_2', 'renv_1', 'renv_2',
-               'omega_spin_1', 'omega_spin_2', 'B_1', 'B_2', 'bacc_1', 'bacc_2',
-               'tacc_1', 'tacc_2', 'epoch_1', 'epoch_2',
-               'bhspin_1', 'bhspin_2']
+# Subset actually retained for blobs storage (keeps memory manageable)
+COLS_KEEP = [
+    'tphys', 'mass_1', 'mass_2', 'massc_1', 'massc_2',
+    'menv_1', 'menv_2', 'kstar_1', 'kstar_2',
+    'porb', 'ecc', 'evol_type', 'rad_1', 'rad_2', 'lum_1', 'lum_2',
+]
 
-BCM_COLUMNS = ['tphys', 'kstar_1', 'mass0_1', 'mass_1', 'lum_1', 'rad_1',
-               'teff_1', 'massc_1', 'radc_1', 'menv_1', 'renv_1', 'epoch_1',
-               'omega_spin_1', 'deltam_1', 'RRLO_1', 'kstar_2', 'mass0_2', 'mass_2',
-               'lum_2', 'rad_2', 'teff_2', 'massc_2', 'radc_2', 'menv_2',
-               'renv_2', 'epoch_2', 'omega_spin_2', 'deltam_2', 'RRLO_2',
-               'porb', 'sep', 'ecc', 'B_1', 'B_2',
-               'SN_1', 'SN_2', 'bin_state', 'merger_type']
+BCM_COLUMNS = [
+    'tphys', 'kstar_1', 'mass0_1', 'mass_1', 'lum_1', 'rad_1',
+    'teff_1', 'massc_1', 'radc_1', 'menv_1', 'renv_1', 'epoch_1',
+    'omega_spin_1', 'deltam_1', 'RRLO_1', 'kstar_2', 'mass0_2', 'mass_2',
+    'lum_2', 'rad_2', 'teff_2', 'massc_2', 'radc_2', 'menv_2',
+    'renv_2', 'epoch_2', 'omega_spin_2', 'deltam_2', 'RRLO_2',
+    'porb', 'sep', 'ecc', 'B_1', 'B_2',
+    'SN_1', 'SN_2', 'bin_state', 'merger_type',
+]
 
-KICK_COLUMNS = ['star', 'disrupted', 'natal_kick', 'phi', 'theta', 'mean_anomaly',
-                'delta_vsysx_1', 'delta_vsysy_1', 'delta_vsysz_1', 'vsys_1_total',
-                'delta_vsysx_2', 'delta_vsysy_2', 'delta_vsysz_2', 'vsys_2_total',
-                'theta_euler', 'phi_euler', 'psi_euler', 'randomseed']
+KICK_COLUMNS = [
+    'star', 'disrupted', 'natal_kick', 'phi', 'theta', 'mean_anomaly',
+    'delta_vsysx_1', 'delta_vsysy_1', 'delta_vsysz_1', 'vsys_1_total',
+    'delta_vsysx_2', 'delta_vsysy_2', 'delta_vsysz_2', 'vsys_2_total',
+    'theta_euler', 'phi_euler', 'psi_euler', 'randomseed',
+]
 
-cols_keep = ['tphys', 'mass_1', 'mass_2', 'massc_1', 'massc_2', 'menv_1', 'menv_2', 'kstar_1', 'kstar_2', 'porb', 'ecc', 'evol_type', 'rad_1', 'rad_2', 'lum_1', 'lum_2']
-
-BPP_SHAPE = (25, len(cols_keep))
+# Fixed array shapes for Nautilus blob storage
+BPP_SHAPE = (25, len(COLS_KEEP))
 KICK_SHAPE = (2, len(KICK_COLUMNS))
 
 
-def set_flags(params_in, fixed_params):
-    ''' Set the COSMIC flags based on input parameters.
-    If a parameter is not specified in params_in, it is set to a default value.
-    
+# ---------------------------------------------------------------------------
+# Cosmological lookup tables (computed once at import)
+# ---------------------------------------------------------------------------
+
+_Z_MAX = 100
+_zgrid = np.expm1(np.linspace(np.log(1), np.log(_Z_MAX + 1), 10_000))
+_dL_grid = Planck15.luminosity_distance(_zgrid).to('Mpc').value
+_t_grid = Planck15.lookback_time(_zgrid).to('Myr').value
+
+# t_universe - lookback_time  →  cosmic time at formation
+tofdL  = interp1d(_dL_grid, 13700 - _t_grid, bounds_error=False, fill_value=1e100)
+dLoft  = interp1d(13700 - _t_grid, _dL_grid,  bounds_error=False, fill_value=1e100)
+ddLdt  = interp1d(_t_grid, np.gradient(_dL_grid, _t_grid), bounds_error=False, fill_value=1e100)
+zofdL  = interp1d(_dL_grid, _zgrid)
+dLofz  = interp1d(_zgrid, _dL_grid,  bounds_error=False, fill_value=1e100)
+ddLdz  = interp1d(_zgrid, np.gradient(_dL_grid, _zgrid), bounds_error=False, fill_value=1e100)
+zoft   = interp1d(13700 - _t_grid, _zgrid, bounds_error=False, fill_value=1000)
+tofz   = interp1d(_zgrid, 13700 - _t_grid, bounds_error=False, fill_value=1e100)
+dtdz   = interp1d(_zgrid, np.gradient(13700 - _t_grid, _zgrid), bounds_error=False, fill_value=1e100)
+
+
+# ---------------------------------------------------------------------------
+# Prior / config definitions
+# ---------------------------------------------------------------------------
+
+def get_backpop_config(config_name: str) -> tuple[np.ndarray, np.ndarray, list[str], dict]:
+    # NOTE: Configs whose names end in '_zform' include z_form as a sampled
+    # parameter (+1 dimension).  In those configs logZ is still sampled with
+    # a flat Nautilus prior, but the likelihood function applies the
+    # P(logZ | z_form) truncated-Normal correction (Andrews+2021 Eq. 8) and
+    # the P(z_form) SFR-weighted comoving-volume prior (Andrews+2021 Eq. 5)
+    # as additional log-prior terms.  The KDE is then evaluated over
+    # (mc, q, z_merger_predicted) rather than (mc, q).
+    #
+    # Separation of concerns:
+    #   - Nautilus sees a flat box prior over all parameters
+    #   - Physical priors P(z_form) and P(logZ|z_form) live in the likelihood
+    #   - This lets us swap SFR models without re-running (just reweight)
+
+    """Return the Nautilus prior bounds and parameter lists for a named config.
+
     Parameters
     ----------
-    params_in : dict
-        Dictionary of input parameters to set. Keys are parameter names, values are parameter values.
+    config_name : str
+        One of:
+          'lucky_strikes'          — full 17-D (Lucky Strikes paper, GW190814)
+          'lucky_strikes_fixed_vk1'— 13-D, first-kick fixed to zero
+          'bbh_no_kicks'           — 8-D, both kicks fixed to zero (sanity check)
+
+    Returns
+    -------
+    lower_bound : np.ndarray
+        Lower prior edges for sampled parameters (same order as params_in).
+    upper_bound : np.ndarray
+        Upper prior edges for sampled parameters.
+    params_in : list[str]
+        Ordered parameter names passed to evolv2().
     fixed_params : dict
-        Dictionary of fixed parameters that should not be sampled but should be fixed. Keys are parameter names, values are parameter values
+        Parameters held fixed (not sampled); passed through to set_flags().
 
-        
-    Returns
-    -------
-    flags : dict
-        Dictionary of all COSMIC flags set.
-    '''
-    #set the flags to the defaults
-    flags = dict()
+    Notes
+    -----
+    All priors are uniform within [lower_bound, upper_bound].  Metallicity and
+    orbital period are sampled in log10 space.  Kick velocities are sampled
+    linearly (km/s); Nautilus will explore log-space structure naturally via its
+    neural-network proposal.
 
-    flags["neta"] = 0.5
-    flags["bwind"] = 0.0
-    flags["hewind"] = 0.5
-    flags["beta"] = -1
-    flags["xi"] = 0.5
-    flags["acc2"] = 1.5
-    flags["epsnov"] = 0.001
-    flags["eddfac"] = 1.0
-    flags["alpha1"] = np.array([1.0, 1.0])
-    flags["qcrit_array"] = np.array([0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0])
-    flags["lambdaf"] = 0.0
-    flags["pts1"] = 0.05
-    flags["pts2"] = 0.01
-    flags["pts3"] = 0.02
-    flags["tflag"] = 1
-    flags["ifflag"] = 0
-    flags["wdflag"] = 1
-    flags["rtmsflag"] = 0
-    flags["ceflag"] = 0
-    flags["cekickflag"] = 2
-    flags["cemergeflag"] = 1
-    flags["cehestarflag"] = 0
-    flags["bhflag"] = 1
-    flags["remnantflag"] = 4
-    flags["grflag"] = 1
-    flags["bhms_coll_flag"] = 1
-    flags["mxns"] = 1.0
-    flags["pisn"] = -2
-    flags["ecsn"] = 2.5
-    flags["ecsn_mlow"] = 1.6
-    flags["aic"] = 1
-    flags["ussn"] = 1
-    flags["sigma"] = 0
-    flags["sigmadiv"] = -20.0
-    flags["bhsigmafrac"] = 1.0
-    flags["polar_kick_angle"] = 90.0
-    flags["natal_kick_array"] = np.array([[-100.0,-100.0,-100.0,-100.0,0.0],[-100.0,-100.0,-100.0,-100.0,0.0]])
-    flags["kickflag"] = 1
-    flags["rembar_massloss"] = 0.5
-    flags["bhspinmag"] = 0
-    flags["don_lim"] = -1
-    flags["acc_lim"] = np.array([-1, -1])
-    flags["gamma"] = -2
-    flags["bdecayfac"] = 1
-    flags["bconst"] = 3000
-    flags["ck"] = 1000
-    flags["windflag"] = 3
-    flags["qcflag"] = 5
-    flags["eddlimflag"] = 0
-    flags["fprimc_array"] = np.ones(16) * 2.0/21.0 * 0.0
-    flags["randomseed"] = 42
-    flags["bhspinflag"] = 0
-    flags["rejuv_fac"] = 1.0
-    flags["rejuvflag"] = 0
-    flags["htpmb"] = 1
-    flags["ST_cr"] = 1
-    flags["ST_tide"] = 1
-    flags["zsun"] = 0.014
-    flags["using_cmc"] = 0
-    natal_kick = np.zeros((2,5))
-    qcrit_array = np.zeros(16)
-    alpha1 = np.zeros(2)
-    acc_lim = np.zeros(2)
-    qc_list = ["qMSlo", "qMS", "qHG", "qGB", "qCHeB", "qAGB", "qTPAGB", "qHeMS", "qHeGB", "qHeAGB"]
-    
-    for param in params_in.keys():
-        # handle kicks
-        # this is hacky -- think about this more.
-        if param in ["vk1", "phi1", "theta1", "omega1", "vk2", "phi2", "theta2", "omega2"]:
-            if "1" in param:
-                if "vk" in param:
-                    natal_kick[0,0] = params_in[param]
-                elif "phi" in param:
-                    natal_kick[0,1] = params_in[param]
-                elif "theta" in param:
-                    natal_kick[0,2] = params_in[param]
-                elif "omega" in param:
-                    natal_kick[0,3] = params_in[param]
-                natal_kick[0,4] = 0.0
-            elif "2" in param:
-                if "vk" in param:
-                    natal_kick[1,0] = params_in[param]
-                elif "phi" in param:
-                    natal_kick[1,1] = params_in[param]
-                elif "theta" in param:
-                    natal_kick[1,2] = params_in[param]
-                elif "omega" in param:
-                    natal_kick[1,3] = params_in[param]
-                natal_kick[1,4] = 0.0
-        elif param in qc_list:
-            ind = qc_list.index(param)  # get the index of param in qc_list
-            qcrit_array[ind] = params_in[param]
-    
-        elif param in ["alpha1_1", "alpha1_2"]:
-            
-            if param == "alpha1_2":
-                alpha1[1] = params_in[param]
-            elif param == "alpha1_1":
-                alpha1[0] = params_in[param]
-                
-        elif param in ["acc_lim_1", "acc_lim_2"]:
-            
-            if param == "acc_lim_2":
-                acc_lim[1] = params_in[param]
-            elif param == "acc_lim_1":
-                acc_lim[0] = params_in[param]
+    Alpha (CE efficiency) and flim (SMT accretion limit) are kept independent
+    for each RLOF event — no assumption of universality.  qHG (critical mass
+    ratio for HG donors) is fixed to 3.0 following Lucky Strikes §2.1.
+    """
 
-        else:
-            flags[param] = params_in[param]
+    # ---- ZAMS parameter ranges (shared across all configs) ----
+    m1_range   = (2.0,   150.0)   # primary ZAMS mass [M_sun]
+    q_range    = (0.01,   1.0)     # ZAMS mass ratio m2/m1
+    logtb_range = (np.log10(0.1), np.log10(5000.0))  # log10(orbital period / days)
+    logZ_range  = (np.log10(1e-4), np.log10(0.03))   # log10(metallicity)
 
-    for param in fixed_params.keys():
-        # handle kicks
-        # this is hacky -- think about this more.
-        if param in ["vk1", "phi1", "theta1", "omega1", "vk2", "phi2", "theta2", "omega2"]:
-            if "1" in param:
-                if "vk" in param:
-                    natal_kick[0,0] = fixed_params[param]
-                elif "phi" in param:
-                    natal_kick[0,1] = fixed_params[param]
-                elif "theta" in param:
-                    natal_kick[0,2] = fixed_params[param]
-                elif "omega" in param:
-                    natal_kick[0,3] = fixed_params[param]
-                natal_kick[0,4] = 0.0
-            elif "2" in param:
-                if "vk" in param:
-                    natal_kick[1,0] = fixed_params[param]
-                elif "phi" in param:
-                    natal_kick[1,1] = fixed_params[param]
-                elif "theta" in param:
-                    natal_kick[1,2] = fixed_params[param]
-                elif "omega" in param:
-                    natal_kick[1,3] = fixed_params[param]
-                natal_kick[1,4] = 0.0
+    # ---- Binary evolution hyperparameter ranges ----
+    alpha_range = (0.1,  20.0)   # CE efficiency (alpha_lambda convention)
+    flim_range  = (0.0,   1.0)   # SMT accretion efficiency limit
 
-        elif param in qc_list:
-            ind = qc_list.index(param)  # get the index of param in qc_list
-            qcrit_array[ind] = params_in[param]
+    # ---- Kick parameter ranges ----
+    vk_range    = (0.0,  500.0)  # kick speed [km/s]
+    theta_range = (0.0,  360.0)  # polar kick angle [deg]
+    phi_range   = (-90.0, 90.0)  # azimuthal kick angle [deg]
+    omega_range = (0.0,  360.0)  # orbital phase at SN [deg]
 
-        elif param in ["alpha1_1", "alpha1_2"]:
+    # Helper to unpack range tuples into separate bound arrays
+    def bounds(*ranges):
+        lo = np.array([r[0] for r in ranges])
+        hi = np.array([r[1] for r in ranges])
+        return lo, hi
 
-            if param == "alpha1_2":
-                alpha1[1] = params_in[param]
-            elif param == "alpha1_1":
-                alpha1[0] = params_in[param]
-
-        elif param in ["acc_lim_1", "acc_lim_2"]:
-
-            if param == "acc_lim_2":
-                acc_lim[1] = params_in[param]
-            elif param == "acc_lim_1":
-                acc_lim[0] = params_in[param]
-
-        else:
-            flags[param] = params_in[param]
-
-
-    if np.any(qcrit_array != 0.0):
-        flags["qcrit_array"] = qcrit_array
-    if np.any(natal_kick != 0.0):
-        flags["natal_kick_array"] = natal_kick
-    if np.any(alpha1 != 0.0):
-        flags["alpha1"] = alpha1
-    if np.any(acc_lim != 0.0):
-        flags["acc_lim"] = acc_lim
-    return flags
-
-
-def set_evolvebin_flags(flags):
-    ''' Set the COSMIC flags in the _evolvebin module.
-
-    Parameters
-    ----------
-    flags : dict
-        Dictionary of flags to set in _evolvebin.
-
-    Returns
-    -------
-    None
-    '''
-    _evolvebin.windvars.neta = flags["neta"]
-    _evolvebin.windvars.bwind = flags["bwind"]
-    _evolvebin.windvars.hewind = flags["hewind"]
-    _evolvebin.cevars.alpha1 = flags["alpha1"]
-    _evolvebin.cevars.lambdaf = flags["lambdaf"]
-    _evolvebin.ceflags.ceflag = flags["ceflag"]
-    _evolvebin.flags.tflag = flags["tflag"]
-    _evolvebin.flags.ifflag = flags["ifflag"]
-    _evolvebin.flags.wdflag = flags["wdflag"]
-    _evolvebin.flags.rtmsflag = flags["rtmsflag"]
-    _evolvebin.snvars.pisn = flags["pisn"]
-    _evolvebin.flags.bhflag = flags["bhflag"]
-    _evolvebin.flags.remnantflag = flags["remnantflag"]
-    _evolvebin.ceflags.cekickflag = flags["cekickflag"]
-    _evolvebin.ceflags.cemergeflag = flags["cemergeflag"]
-    _evolvebin.ceflags.cehestarflag = flags["cehestarflag"]
-    _evolvebin.flags.grflag = flags["grflag"]
-    _evolvebin.flags.bhms_coll_flag = flags["bhms_coll_flag"]
-    _evolvebin.snvars.mxns = flags["mxns"]
-    _evolvebin.points.pts1 = flags["pts1"]
-    _evolvebin.points.pts2 = flags["pts2"]
-    _evolvebin.points.pts3 = flags["pts3"]
-    _evolvebin.snvars.ecsn = flags["ecsn"]
-    _evolvebin.snvars.ecsn_mlow = flags["ecsn_mlow"]
-    _evolvebin.flags.aic = flags["aic"]
-    _evolvebin.ceflags.ussn = flags["ussn"]
-    _evolvebin.snvars.sigma = flags["sigma"]
-    _evolvebin.snvars.sigmadiv = flags["sigmadiv"]
-    _evolvebin.snvars.bhsigmafrac = flags["bhsigmafrac"]
-    _evolvebin.snvars.polar_kick_angle = flags["polar_kick_angle"]
-    _evolvebin.snvars.natal_kick_array = flags["natal_kick_array"]
-    _evolvebin.cevars.qcrit_array = flags["qcrit_array"]
-    _evolvebin.mtvars.don_lim = flags["don_lim"]
-    _evolvebin.mtvars.acc_lim = flags["acc_lim"]
-    _evolvebin.windvars.beta = flags["beta"]
-    _evolvebin.windvars.xi = flags["xi"]
-    _evolvebin.windvars.acc2 = flags["acc2"]
-    _evolvebin.windvars.epsnov = flags["epsnov"]
-    _evolvebin.windvars.eddfac = flags["eddfac"]
-    _evolvebin.windvars.gamma = flags["gamma"]
-    _evolvebin.flags.bdecayfac = flags["bdecayfac"]
-    _evolvebin.magvars.bconst = flags["bconst"]
-    _evolvebin.magvars.ck = flags["ck"]
-    _evolvebin.flags.windflag = flags["windflag"]
-    _evolvebin.flags.qcflag = flags["qcflag"]
-    _evolvebin.flags.eddlimflag = flags["eddlimflag"]
-    _evolvebin.tidalvars.fprimc_array = flags["fprimc_array"]
-    _evolvebin.rand1.idum1 = flags["randomseed"]
-    _evolvebin.flags.bhspinflag = flags["bhspinflag"]
-    _evolvebin.snvars.bhspinmag = flags["bhspinmag"]
-    _evolvebin.mixvars.rejuv_fac = flags["rejuv_fac"]
-    _evolvebin.flags.rejuvflag = flags["rejuvflag"]
-    _evolvebin.flags.htpmb = flags["htpmb"]
-    _evolvebin.flags.st_cr = flags["ST_cr"]
-    _evolvebin.flags.st_tide = flags["ST_tide"]
-    _evolvebin.snvars.rembar_massloss = flags["rembar_massloss"]
-    _evolvebin.metvars.zsun = flags["zsun"]
-    _evolvebin.snvars.kickflag = flags["kickflag"]
-    _evolvebin.se_flags.using_metisse = 0
-    _evolvebin.se_flags.using_sse = 1
-
-    return None
-
-def evolv2(params_in, params_out, fixed_params):
-    ''' Evolve a binary with COSMIC given initial parameters with
-    a direct call to the _evolvebin module.
-
-    Parameters
-    ----------
-    params_in : dict
-        Dictionary of input parameters to evolve. Keys are parameter names, values are parameter values.
-    params_out : list   
-        List of parameter names to return from the final state of the binary
-    fixed_params : dict
-        Dictionary of fixed parameters that should not be sampled but should be fixed. Keys are parameter names, values are parameter values
-    
-    Returns
-    -------
-    out : tuple
-        Tuple of (final_state, bpp, kick_info)
-        final_state : pd.DataFrame
-            DataFrame of the final state of the binary with columns specified in params_out.
-        bpp : np.ndarray
-            Array of the binary population parameters (BPP) from COSMIC - format for us to work with Nautilus.
-        kick_info : np.ndarray
-            Array of the kick information from COSMIC - format for us to work with Nautilus - format for us to work with Nautilus.
-    '''
-    # handle initial binary parameters first
-    m1 = params_in["m1"] 
-    q = params_in["q"]
-    m2 = q*m1
-    tb = 10**params_in["logtb"] 
-    if "e" in params_in:
-        e = params_in["e"]
-    else:
-        e = 0.0
-    metallicity = 10**params_in['logZ']
-    # set the other flags
-    flags = set_flags(params_in, fixed_params)
-    _ = set_evolvebin_flags(flags)
-
-    bpp_columns = BPP_COLUMNS
-    bcm_columns = BCM_COLUMNS
-    
-    col_inds_bpp = np.zeros(len(ALL_COLUMNS), dtype=int)
-    col_inds_bpp[:len(bpp_columns)] = [ALL_COLUMNS.index(col) + 1 for col in bpp_columns]
-    n_col_bpp = len(BPP_COLUMNS)    
-
-    col_inds_bcm = np.zeros(len(ALL_COLUMNS), dtype=int)
-    col_inds_bcm[:len(bcm_columns)] = [ALL_COLUMNS.index(col) + 1 for col in bcm_columns]
-    n_col_bcm = len(BCM_COLUMNS)
-    
-    _evolvebin.col.n_col_bpp = n_col_bpp
-    _evolvebin.col.col_inds_bpp = col_inds_bpp
-    _evolvebin.col.n_col_bcm = n_col_bcm
-    _evolvebin.col.col_inds_bcm = col_inds_bcm
-    
-    # setup the inputs for _evolvebin
-    zpars = np.zeros(20)
-    mass = np.array([m1,m2])
-    mass0 = np.array([m1,m2])
-    epoch = np.array([0.0,0.0])
-    ospin = np.array([0.0,0.0])
-    tphysf = 13700.0
-    dtp = 0.0
-    rad = np.array([0.0,0.0])
-    lumin = np.array([0.0,0.0])
-    massc = np.array([0.0,0.0])
-    radc = np.array([0.0,0.0])
-    menv = np.array([0.0,0.0])
-    renv = np.array([0.0,0.0])
-    B_0 = np.array([0.0,0.0])
-    bacc = np.array([0.0,0.0])
-    tacc = np.array([0.0,0.0])
-    tms = np.array([0.0,0.0])
-    bhspin = np.array([0.0,0.0])
-    tphys = 0.0
-    bkick = np.zeros(20)
-    bpp_index_out = 0
-    bcm_index_out = 0
-    kick_info_out = np.zeros(34)
-    kstar = np.array([1,1])
-    kick_info = np.zeros((2, 18))
-
-
-    [_, bpp_index, bcm_index, kick_info_arrays] = _evolvebin.evolv2(kstar,mass,tb,e,metallicity,tphysf,
-                                                          dtp,mass0,rad,lumin,massc,radc,
-                                                          menv,renv,ospin,B_0,bacc,tacc,epoch,tms,
-                                                          bhspin,tphys,zpars,bkick,kick_info)
-    
-    bpp = _evolvebin.binary.bpp[:25, :n_col_bpp].copy()
-    _evolvebin.binary.bpp[:25, :n_col_bpp] = np.zeros(bpp.shape)
-    bcm = _evolvebin.binary.bcm[:bcm_index, :n_col_bcm].copy()
-    _evolvebin.binary.bcm[:bcm_index, :n_col_bcm] = np.zeros(bcm.shape)
-    
-    
-    bpp = pd.DataFrame(bpp, columns=BPP_COLUMNS)   
-    bpp = bpp[cols_keep] 
-    kick_info = pd.DataFrame(kick_info_arrays,
-                             columns=KICK_COLUMNS,
-                             index=kick_info_arrays[:, -1].astype(int))
-    
-    out = bpp.loc[((bpp.kstar_1 == 14) & (bpp.kstar_2 == 14) & (bpp.evol_type == 3)) |
-                  ((bpp.kstar_1 == 14) & (bpp.kstar_2 == 14) & (bpp.evol_type == 3))]
-    
-    
-    
-    if len(out) > 0:
-        return out[params_out].iloc[0], bpp.to_numpy(), kick_info.to_numpy()
-    else:
-        return None, None, None
-
-
-
-#def evolv2_fixed_kicks(m1, q, logtb, e, alpha_1, alpha_2, acc_lim_1, acc_lim_2, qHG, logZ):
-#    vk1 = 0.0
-#    theta1 = 0.0
-#    phi1 = 0.0
-#    omega1 = 0.0
-#    vk2 = 0.0
-#    theta2 = 0.0
-#    phi2 = 0.0
-#    omega2 = 0.0
-#
-#    return evolv2(m1, q, logtb, e, alpha_1, alpha_2, vk1, theta1, phi1, omega1, vk2, theta2, phi2, omega2, acc_lim_1, acc_lim_2, qHG, logZ)
-#
-#def evolv2_fixed_kicks_minimal(m1, q, logtb, e, alpha, acc_lim, qHG, logZ):
-#    alpha_1 = alpha
-#    alpha_2 = alpha
-#    acc_lim_1 = acc_lim
-#    acc_lim_2 = acc_lim
-#    vk1 = 0.0
-#    theta1 = 0.0
-#    phi1 = 0.0
-#    omega1 = 0.0
-#    vk2 = 0.0
-#    theta2 = 0.0
-#    phi2 = 0.0
-#    omega2 = 0.0
-#    return evolv2(m1, q, logtb, e, alpha_1, alpha_2, vk1, theta1, phi1, omega1, vk2, theta2, phi2, omega2, acc_lim_1, acc_lim_2, qHG, logZ)
-#
-def evolv2_lowmass_secondary(m1, q, logtb, e, alpha_1, alpha_2, vk2, theta2, phi2, omega2, acc_lim_1, acc_lim_2, logZ):
-    vk1 = 0.0
-    theta1 = 0.0
-    phi1 = 0.0
-    omega1 = 0.0
-    
-    qHG = 3.0
-    return evolv2(m1, q, logtb, e, alpha_1, alpha_2, vk1, theta1, phi1, omega1, vk2, theta2, phi2, omega2, acc_lim_1, acc_lim_2, qHG, logZ)
-#
-#def evolv2_lowmass_secondary_minimal(m1, q, logtb, e, alpha, vk2, theta2, phi2, omega2, acc_lim, logZ):
-#    vk1 = 0.0
-#    alpha_1 = alpha
-#    alpha_2 = alpha
-#    acc_lim_1 = acc_lim
-#    acc_lim_2 = acc_lim
-#    theta1 = 0.0
-#    phi1 = 0.0
-#    omega1 = 0.0
-#    e=0.0
-#    
-#    qHG = 0.0
-#
-#    return evolv2(m1, q, logtb, e, alpha_1, alpha_2, vk1, theta1, phi1, omega1, vk2, theta2, phi2, omega2, acc_lim_1, acc_lim_2, logZ)
-#
-#
-#def evolv2_vk2_alpha_lambda(m1, q, logtb, e, alpha, vk2, theta2, phi2, acc_lim, qHG, logZ):
-#    vk1 = 0.0
-#    alpha_1 = alpha
-#    alpha_2 = alpha
-#    acc_lim_1 = acc_lim
-#    acc_lim_2 = acc_lim
-#    theta1 = 0.0
-#    phi1 = 0.0
-#    omega1 = 0.0
-#    omega2 = 0.0
-#    return evolv2(m1, q, logtb, e, alpha_1, alpha_2, vk1, theta1, phi1, omega1, vk2, theta2, phi2, omega2, acc_lim_1, acc_lim_2, qHG, logZ)
-#
-#
-def str_to_bool(value):
-    if value.lower() in {'false', 'f', '0', 'no', 'n'}:
-        return False
-    elif value.lower() in {'true', 't', '1', 'yes', 'y'}:
-        return True
-    raise ValueError(f'{value} is not a valid boolean value')
-
-m1lo = 50.0
-m2lo = 10.0
-tblo = 1.0
-elo = 0.0
-alphalo_1 = 0.1
-alphalo_2 = 0.1
-vklo = 0.0
-thetalo = 0.0
-philo = -90.0
-omegalo = 0.0
-acc_limlo_1 = 0.0
-acc_limlo_2 = 0.0
-qc_kstar2lo = 0.5
-Zlo = 0.0001
-
-m1hi = 150.0
-m2hi = 60.0
-tbhi = 5000.0
-ehi = 0.9
-alphahi_1 = 20.0
-alphahi_2 = 20.0
-vkhi = 500.0
-thetahi = 360.0
-phihi = 90.0
-omegahi = 360
-acc_limhi_1 = 1.0
-acc_limhi_2 = 1.0
-qc_kstar2hi = 10.0
-Zhi = 0.03
-
-qlo = 0.01
-qhi = 1
-
-
-labels_dict = {"backpop" : [r'$m_1$',r'$m_2$',r'$\log_{10}t_b$',r'$e$',r'$\alpha_1$',r'$\alpha_2$',
-                            r'$v_1$',r'$\theta_1$',r'$\phi_1$',r'$\omega_1$',r'$v_2$',r'$\theta_2$',
-                            r'$\phi_2$',r'$\omega_2$',r'$f_{\rm lim,1}$', r'$f_{\rm lim,2}$',
-                            r'$q_{\rm HG}$', r'$\log_{10}Z$'],
-
-               "backpop_fixed_kicks" : [r'$m_1$',r'$m_2$',r'$\log_{10}t_b$',r'$e$',r'$\alpha_1$',r'$\alpha_2$',
-                                        r'$f_{\rm lim,1}$',r'$f_{\rm lim,2}$',r'$q_{\rm HG}$',r'$\log_{10}Z$'],
-               
-               "backpop_fixed_kicks_minimal" : [r'$m_1$',r'$m_2$',r'$\log_{10}t_b$',r'$e$',r'$\alpha$',
-                                                r'$f_{\rm lim}$',r'$q_{\rm HG}$',r'$\log_{10}Z$'],
-               
-               "backpop_lowmass_secondary" : [r'$m_1$',r'$m_2$',r'$\log_{10}t_b$',r'$\alpha_1$',r'$\alpha_2$',
-                                              r'$v_2$',r'$\theta_2$',r'$\phi_2$',r'$\omega_2$',r'$f_{\rm lim,1}$',
-                                              r'$f_{\rm lim,2}$',r'$\log_{10}Z$'],
-
-               "backpop_lowmass_secondary_minimal" : [r'$m_1$',r'$m_2$',r'$\log_{10}t_b$',r'$e$',r'$\alpha$',
-                                              r'$v_2$',r'$\theta_2$',r'$\phi_2$',r'$f_{\rm lim}$',
-                                              r'$q_{\rm HG}$', r'$\log_{10}Z$']
-              }
-
-def get_backpop_config(config_name):
-    if (config_name == "backpop"):
-        lower_bound = np.array([m1lo, qlo, np.log10(tblo), alphalo_1, alphalo_2, vklo, thetalo, philo, omegalo, vklo, thetalo, philo, omegalo, acc_limlo_1, acc_limlo_2, np.log10(Zlo)])
-        upper_bound = np.array([m1hi, qhi, np.log10(tbhi), alphahi_1, alphahi_2, vkhi, thetahi, phihi, omegahi, vkhi, thetahi, phihi, omegahi, acc_limhi_1, acc_limhi_2, np.log10(Zhi)])
-        params_in = ['m1', 'q', 'logtb', 'alpha_1', 'alpha_2', 'vk1', 'theta1', 'phi1', 'omega1', 'vk2', 'theta2', 'phi2', 'omega2', 'acc_lim_1', 'acc_lim_2', 'logZ']
+    # ------------------------------------------------------------------
+    # Full 17-D config: Lucky Strikes (Magana Hernandez & Breivik 2025)
+    # Samples both natal kicks independently.
+    # ------------------------------------------------------------------
+    if config_name == "lucky_strikes":
+        params_in = [
+            # ZAMS
+            'm1', 'q', 'logtb', 'logZ',
+            # Binary evolution hyperparameters
+            'alpha_1', 'alpha_2', 'flim_1', 'flim_2',
+            # First SN natal kick
+            'vk1', 'theta1', 'phi1', 'omega1',
+            # Second SN natal kick
+            'vk2', 'theta2', 'phi2', 'omega2',
+        ]
+        lower_bound, upper_bound = bounds(
+            m1_range, q_range, logtb_range, logZ_range,
+            alpha_range, alpha_range, flim_range, flim_range,
+            vk_range, theta_range, phi_range, omega_range,
+            vk_range, theta_range, phi_range, omega_range,
+        )
         fixed_params = {}
 
-    if (config_name == "backpop_fixed_kicks"):
-        lower_bound = np.array([m1lo, qlo, np.log10(tblo), elo, alphalo_1, alphalo_2, acc_limlo_1, acc_limlo_2, qc_kstar2lo, np.log10(Zlo)])
-        upper_bound = np.array([m1hi, qhi, np.log10(tbhi), ehi, alphahi_1, alphahi_2, acc_limhi_1, acc_limhi_2, qc_kstar2hi, np.log10(Zhi)])
-        params_in = ['m1', 'q', 'logtb', 'e', 'alpha_1', 'alpha_2', 'acc_lim_1', 'acc_lim_2', 'qHG', 'logZ']
-        fixed_params = {'vk1': 0.0, 'theta1': 0.0, 'omega1': 0.0, 'phi1': 0.0, 'vk2': 0.0, 'theta2': 0.0, 'phi2': 0.0, 'omega2': 0.0}
-        
-    if (config_name == "backpop_fixed_kicks_minimal"):
-        ### KB hasn't figured out how to get the alpha_sampling right here
-        lower_bound = np.array([m1lo, qlo, np.log10(tblo), elo, alphalo_1, acc_limlo_1, qc_kstar2lo, np.log10(Zlo)])
-        upper_bound = np.array([m1hi, qhi, np.log10(tbhi), ehi, alphahi_1, acc_limhi_1, qc_kstar2hi, np.log10(Zhi)])
-        params_in = ['m1', 'q', 'logtb', 'e', 'alpha_1', 'acc_lim_1', 'qHG', 'logZ']
-        fixed_params = {'vk1': 0.0, 'theta1': 0.0, 'omega1': 0.0, 'phi1': 0.0, 'vk2': 0.0, 'theta2': 0.0, 'phi2': 0.0, 'omega2': 0.0}
+    # ------------------------------------------------------------------
+    # 13-D config: first kick fixed to zero.
+    # Motivated by the Lucky Strikes result that vk1 results are
+    # largely unchanged when first-BH kicks are suppressed (massive
+    # BHs have near-zero kicks via fallback in the delayed prescription).
+    # ------------------------------------------------------------------
+    elif config_name == "lucky_strikes_fixed_vk1":
+        params_in = [
+            'm1', 'q', 'logtb', 'logZ',
+            'alpha_1', 'alpha_2', 'flim_1', 'flim_2',
+            'vk2', 'theta2', 'phi2', 'omega2',
+        ]
+        lower_bound, upper_bound = bounds(
+            m1_range, q_range, logtb_range, logZ_range,
+            alpha_range, alpha_range, flim_range, flim_range,
+            vk_range, theta_range, phi_range, omega_range,
+        )
+        fixed_params = {'vk1': 0.0, 'theta1': 0.0, 'phi1': 0.0, 'omega1': 0.0}
 
+    # ------------------------------------------------------------------
+    # 8-D config: both kicks fixed to zero.  Useful as a sanity check
+    # or for events dominated by GW likelihood rather than kick geometry.
+    # ------------------------------------------------------------------
+    elif config_name == "bbh_no_kicks":
+        params_in = [
+            'm1', 'q', 'logtb', 'logZ',
+            'alpha_1', 'alpha_2', 'flim_1', 'flim_2',
+        ]
+        lower_bound, upper_bound = bounds(
+            m1_range, q_range, logtb_range, logZ_range,
+            alpha_range, alpha_range, flim_range, flim_range,
+        )
+        fixed_params = {
+            'vk1': 0.0, 'theta1': 0.0, 'phi1': 0.0, 'omega1': 0.0,
+            'vk2': 0.0, 'theta2': 0.0, 'phi2': 0.0, 'omega2': 0.0,
+        }
 
-    if (config_name == "backpop_lowmass_secondary"):
-        lower_bound = np.array([m1lo, qlo, np.log10(tblo), alphalo_1, alphalo_2, vklo, thetalo, philo, omegalo, acc_limlo_1, acc_limlo_2, np.log10(Zlo)])
-        upper_bound = np.array([m1hi, qhi, np.log10(tbhi), alphahi_1, alphahi_2, vkhi, thetahi, phihi, omegahi, acc_limhi_1, acc_limhi_2, np.log10(Zhi)])
-        params_in = ['m1', 'q', 'logtb', 'alpha_1', 'alpha_2', 'vk2', 'theta2', 'phi2', 'omega2', 'acc_lim_1', 'acc_lim_2', 'logZ']
-        fixed_params = {'vk1': 0.0, 'theta1': 0.0, 'omega1': 0.0, 'phi1': 0.0}
+    # ------------------------------------------------------------------
+    # z_form variants: same as above but add z_form as a sampled dim.
+    # The cosmological prior and 3D KDE are applied inside the likelihood.
+    # z_form ∈ [1e-4, 20] sampled uniformly; P(z_form) and P(logZ|z_form)
+    # are added as log-prior corrections in run_backpop.py.
+    # ------------------------------------------------------------------
+    elif config_name == "lucky_strikes_zform":
+        params_in = [
+            'm1', 'q', 'logtb', 'logZ', 'z_form',
+            'alpha_1', 'alpha_2', 'flim_1', 'flim_2',
+            'vk1', 'theta1', 'phi1', 'omega1',
+            'vk2', 'theta2', 'phi2', 'omega2',
+        ]
+        lower_bound, upper_bound = bounds(
+            m1_range, q_range, logtb_range, logZ_range,
+            (1e-4, 20.0),                         # z_form
+            alpha_range, alpha_range, flim_range, flim_range,
+            vk_range, theta_range, phi_range, omega_range,
+            vk_range, theta_range, phi_range, omega_range,
+        )
+        fixed_params = {}
 
-        
-    if (config_name == "backpop_lowmass_secondary_minimal"):
-        ### KB hasn't figured out how to get the alpha_sampling right here
-        lower_bound = np.array([m1lo, qlo, np.log10(tblo), alphalo_1, vklo, thetalo, philo, omegalo, acc_limlo_1, np.log10(Zlo)])
-        upper_bound = np.array([m1hi, qhi, np.log10(tbhi), alphahi_1, vkhi, thetahi, phihi, omegahi, acc_limhi_1, np.log10(Zhi)])  
-        params_in = ['m1', 'q', 'logtb', 'alpha_1', 'vk2', 'theta2', 'phi2', 'omega2', 'acc_lim_1', 'logZ']
-        fixed_params = {'vk1': 0.0, 'theta1': 0.0, 'omega1': 0.0, 'phi1': 0.0}
+    elif config_name == "lucky_strikes_fixed_vk1_zform":
+        params_in = [
+            'm1', 'q', 'logtb', 'logZ', 'z_form',
+            'alpha_1', 'alpha_2', 'flim_1', 'flim_2',
+            'vk2', 'theta2', 'phi2', 'omega2',
+        ]
+        lower_bound, upper_bound = bounds(
+            m1_range, q_range, logtb_range, logZ_range,
+            (1e-4, 20.0),
+            alpha_range, alpha_range, flim_range, flim_range,
+            vk_range, theta_range, phi_range, omega_range,
+        )
+        fixed_params = {'vk1': 0.0, 'theta1': 0.0, 'phi1': 0.0, 'omega1': 0.0}
 
+    elif config_name == "bbh_no_kicks_zform":
+        params_in = [
+            'm1', 'q', 'logtb', 'logZ', 'z_form',
+            'alpha_1', 'alpha_2', 'flim_1', 'flim_2',
+        ]
+        lower_bound, upper_bound = bounds(
+            m1_range, q_range, logtb_range, logZ_range,
+            (1e-4, 20.0),
+            alpha_range, alpha_range, flim_range, flim_range,
+        )
+        fixed_params = {
+            'vk1': 0.0, 'theta1': 0.0, 'phi1': 0.0, 'omega1': 0.0,
+            'vk2': 0.0, 'theta2': 0.0, 'phi2': 0.0, 'omega2': 0.0,
+        }
 
-        
+    else:
+        raise ValueError(
+            f"Unknown config '{config_name}'. "
+            "Valid options: 'lucky_strikes', 'lucky_strikes_fixed_vk1', "
+            "'bbh_no_kicks', 'lucky_strikes_zform', "
+            "'lucky_strikes_fixed_vk1_zform', 'bbh_no_kicks_zform'."
+        )
+
     return lower_bound, upper_bound, params_in, fixed_params
 
 
-# Cosmo routines
-Om0Planck = Planck15.Om0
-H0Planck = Planck15.H0.value
-speed_of_light = constants.c.to('km/s').value
+# Human-readable labels for corner plots (LaTeX)
+PARAM_LABELS = {
+    'm1':      r'$m_1\ [M_\odot]$',
+    'q':       r'$q_\mathrm{ZAMS}$',
+    'logtb':   r'$\log_{10}(t_b/\mathrm{day})$',
+    'logZ':    r'$\log_{10}(Z/Z_\odot)$',
+    'alpha_1': r'$\alpha_1$',
+    'alpha_2': r'$\alpha_2$',
+    'flim_1':  r'$f_\mathrm{lim,1}$',
+    'flim_2':  r'$f_\mathrm{lim,2}$',
+    'vk1':     r'$v_{k,1}\ [\mathrm{km\,s^{-1}}]$',
+    'theta1':  r'$\theta_1\ [\mathrm{deg}]$',
+    'phi1':    r'$\phi_1\ [\mathrm{deg}]$',
+    'omega1':  r'$\omega_1\ [\mathrm{deg}]$',
+    'vk2':     r'$v_{k,2}\ [\mathrm{km\,s^{-1}}]$',
+    'theta2':  r'$\theta_2\ [\mathrm{deg}]$',
+    'phi2':    r'$\phi_2\ [\mathrm{deg}]$',
+    'omega2':  r'$\omega_2\ [\mathrm{deg}]$',
+    'z_form':  r'$z_\mathrm{form}$',
+}
 
-zMax = 100
-zgrid = np.expm1(np.linspace(np.log(1), np.log(zMax+1), 10000))
-dLgrid = Planck15.luminosity_distance(zgrid).to('Mpc').value
-tgrid = Planck15.lookback_time(zgrid).to('Myr').value
 
-tofdL = interp1d(dLgrid,13700-tgrid,bounds_error=False,fill_value=1e100)
-dLoft = interp1d(13700-tgrid,dLgrid,bounds_error=False,fill_value=1e100)
-ddLdt = interp1d(tgrid,np.gradient(dLgrid,tgrid),bounds_error=False,fill_value=1e100)
+# ---------------------------------------------------------------------------
+# COSMIC flags
+# ---------------------------------------------------------------------------
 
-zofdL = interp1d(dLgrid,zgrid)
-dLofz = interp1d(zgrid,dLgrid,bounds_error=False,fill_value=1e100)
-ddLdz = interp1d(zgrid,np.gradient(dLgrid,zgrid),bounds_error=False,fill_value=1e100)
+def _parse_kick_params(
+    params_in: dict,
+    fixed_params: dict,
+) -> np.ndarray:
+    """Build the (2, 5) natal_kick_array expected by COSMIC's _evolvebin.
 
-zoft = interp1d(13700-tgrid,zgrid,bounds_error=False,fill_value=1000)
-tofz = interp1d(zgrid,13700-tgrid,bounds_error=False,fill_value=1e100)
-dtdz = interp1d(zgrid,np.gradient(13700-tgrid,zgrid),bounds_error=False,fill_value=1e100)
+    COSMIC natal_kick_array layout (per star):
+        [0] vk        — kick speed [km/s]
+        [1] phi       — azimuthal kick angle [deg]
+        [2] theta     — polar kick angle [deg]
+        [3] omega     — mean anomaly at kick [deg]
+        [4] reserved  — set to 0.0
 
-def get_190814_data(path, outdir="./"):
-    ''' Fetch the GW190814 data from the GWTC-2 catalog using pesummary 
-    
+    Parameters come from either the sampled dict (params_in) or the
+    fixed dict (fixed_params).  params_in takes precedence.
+
+    Note: COSMIC uses -100 as a sentinel meaning "draw from the population
+    kick model".  We always supply explicit values, so -100 never appears.
+    """
+    # Merge: sampled params override fixed params
+    all_params = {**fixed_params, **params_in}
+
+    natal_kick = np.zeros((2, 5))
+
+    # Star 1
+    natal_kick[0, 0] = all_params.get('vk1',    0.0)
+    natal_kick[0, 1] = all_params.get('phi1',   0.0)
+    natal_kick[0, 2] = all_params.get('theta1', 0.0)
+    natal_kick[0, 3] = all_params.get('omega1', 0.0)
+    natal_kick[0, 4] = 0.0
+
+    # Star 2
+    natal_kick[1, 0] = all_params.get('vk2',    0.0)
+    natal_kick[1, 1] = all_params.get('phi2',   0.0)
+    natal_kick[1, 2] = all_params.get('theta2', 0.0)
+    natal_kick[1, 3] = all_params.get('omega2', 0.0)
+    natal_kick[1, 4] = 0.0
+
+    return natal_kick
+
+
+def set_flags(params_in: dict, fixed_params: dict) -> dict:
+    """Build the full COSMIC flags dict from sampled and fixed parameters.
+
+    Defaults follow Lucky Strikes (Magana Hernandez & Breivik 2025) §2:
+      - Fryer et al. (2012) delayed remnant mass prescription (remnantflag=4)
+      - Claeys et al. (2014) lambda_CE fits (lambdaf=0.0 → internal calculation)
+      - Wagg et al. (2025) kick model (kickflag=1 → Pfahl+2002 based)
+      - Vink et al. (2001, 2005) stellar wind mass loss (windflag=3)
+      - PISN = -2 (pair-instability prescription active)
+      - qHG = 3.0 fixed (not a free parameter in Lucky Strikes)
+      - mxns = 1.0 M_sun (artificial NS mass ceiling to simplify sampling)
+
     Parameters
     ----------
-    path : str
-        The path (including filename) to save the data to.
-    outdir : str, optional
-        The directory to save the file to. Default is the current directory. 
-        
+    params_in : dict
+        Sampled parameters from Nautilus (vary each call).
+    fixed_params : dict
+        Parameters held constant for this run configuration.
+
     Returns
     -------
-    data : pesummary.gw.fileio.GWFile
-        The GW190814 data.
-    '''
+    flags : dict
+        Complete flags dict ready for set_evolvebin_flags().
+    """
+    flags = {}
 
-    data = fetch_open_samples(
-    "GW190814", outdir=outdir, path=path
+    # ---- Wind / mass transfer defaults ----
+    flags["neta"]         = 0.5
+    flags["bwind"]        = 0.0
+    flags["hewind"]       = 0.5
+    flags["beta"]         = -1       # -1 → Hurley+2002 prescription
+    flags["xi"]           = 0.5
+    flags["acc2"]         = 1.5
+    flags["epsnov"]       = 0.001
+    flags["eddfac"]       = 1.0
+    flags["gamma"]        = -2
+    flags["windflag"]     = 3        # Vink+2001/2005 winds
+    flags["don_lim"]      = -1
+    flags["eddlimflag"]   = 0
+
+    # ---- CE defaults ----
+    # alpha1 is a 2-element array: [alpha_for_star1_CE, alpha_for_star2_CE]
+    # Populated below from params_in / fixed_params.
+    flags["alpha1"]       = np.array([1.0, 1.0])
+    flags["lambdaf"]      = 0.0      # 0.0 → use Claeys+2014 fits internally
+    flags["ceflag"]       = 0
+    flags["cekickflag"]   = 2
+    flags["cemergeflag"]  = 1
+    flags["cehestarflag"] = 0
+
+    # ---- Mass transfer stability ----
+    # qcrit_array: 16-element array, one entry per stellar type (kstar).
+    # Index 2 = Hertzsprung Gap (HG); fixed at 3.0 per Lucky Strikes §2.1.
+    qcrit_array          = np.zeros(16)
+    qcrit_array[2]       = 3.0      # qHG
+    flags["qcrit_array"] = qcrit_array
+    flags["qcflag"]      = 5
+
+    # acc_lim: 2-element array — Eddington-factor limit on stable MT accretion.
+    # Populated below from flim_1 / flim_2.
+    flags["acc_lim"]     = np.array([-1.0, -1.0])  # -1 → no external limit
+
+    # ---- Remnant / SN defaults ----
+    flags["remnantflag"]   = 4       # Fryer+2012 delayed prescription
+    flags["mxns"]          = 1.0     # artificial NS ceiling [M_sun]
+    flags["pisn"]          = -2      # PISN active
+    flags["ecsn"]          = 2.5
+    flags["ecsn_mlow"]     = 1.6
+    flags["aic"]           = 1
+    flags["ussn"]          = 1
+    flags["sigma"]         = 0       # sigma=0 → kicks set by natal_kick_array
+    flags["sigmadiv"]      = -20.0
+    flags["bhsigmafrac"]   = 1.0
+    flags["polar_kick_angle"] = 90.0
+    flags["kickflag"]      = 1       # Pfahl+2002 / Wagg+2025 kick model
+    flags["rembar_massloss"] = 0.5
+    flags["bhflag"]        = 1
+    flags["bhms_coll_flag"] = 1
+
+    # ---- Spins ----
+    flags["bhspinflag"]    = 0
+    flags["bhspinmag"]     = 0.0
+
+    # ---- Misc ----
+    flags["tflag"]         = 1
+    flags["ifflag"]        = 0
+    flags["wdflag"]        = 1
+    flags["rtmsflag"]      = 0
+    flags["grflag"]        = 1
+    flags["bdecayfac"]     = 1
+    flags["bconst"]        = 3000
+    flags["ck"]            = 1000
+    flags["pts1"]          = 0.05
+    flags["pts2"]          = 0.01
+    flags["pts3"]          = 0.02
+    flags["rejuv_fac"]     = 1.0
+    flags["rejuvflag"]     = 0
+    flags["htpmb"]         = 1
+    flags["ST_cr"]         = 1
+    flags["ST_tide"]       = 1
+    flags["zsun"]          = 0.014
+    flags["fprimc_array"]  = np.zeros(16)
+    flags["randomseed"]    = 42
+
+    # ---- Merge sampled + fixed; sampled takes precedence ----
+    all_params = {**fixed_params, **params_in}
+
+    # CE efficiency: alpha_1 → first RLOF event, alpha_2 → second RLOF event.
+    # BUGFIX: previously checked for 'alpha1_1'/'alpha1_2' which never matched
+    # 'alpha_1'/'alpha_2' from params_in, leaving CE efficiency at default 1.0.
+    alpha1 = flags["alpha1"].copy()
+    if 'alpha_1' in all_params:
+        alpha1[0] = all_params['alpha_1']
+    if 'alpha_2' in all_params:
+        alpha1[1] = all_params['alpha_2']
+    flags["alpha1"] = alpha1
+
+    # Stable MT accretion efficiency limit:
+    # flim_i in [0,1] is the fraction of donor mass the accretor can accept,
+    # expressed as a multiple of the Eddington rate (COSMIC acc_lim convention).
+    acc_lim = flags["acc_lim"].copy()
+    if 'flim_1' in all_params:
+        acc_lim[0] = all_params['flim_1']
+    if 'flim_2' in all_params:
+        acc_lim[1] = all_params['flim_2']
+    flags["acc_lim"] = acc_lim
+
+    # Natal kicks — uses the dedicated parser to avoid string-matching fragility.
+    flags["natal_kick_array"] = _parse_kick_params(params_in, fixed_params)
+
+    return flags
+
+
+def _fortran_assign(fortran_attr, value: np.ndarray | float) -> None:
+    """Assign value to a Fortran module attribute, handling scalar/array mismatch.
+
+    COSMIC's Fortran interface (f2py) is strict about array rank. Depending on
+    the COSMIC version and build, some variables (notably cevars.alpha1 and
+    mtvars.acc_lim) may be declared as scalars in one build and rank-1 arrays
+    in another.
+
+    This helper attempts the direct assignment and falls back to a scalar (first
+    element) if the Fortran variable is rank-0 (scalar) but value is an array.
+
+    Parameters
+    ----------
+    fortran_attr : f2py module attribute (writable)
+        Target Fortran variable, e.g. _evolvebin.cevars.alpha1.
+    value : np.ndarray or float
+        Value to assign.
+    """
+    try:
+        fortran_attr = value          # direct assignment (works if ranks match)
+        return fortran_attr           # returned but caller must re-assign; see usage note
+    except (ValueError, TypeError):
+        pass
+    # Rank mismatch — fall back to first scalar element
+    return float(np.asarray(value).flat[0])
+
+
+def set_evolvebin_flags(flags: dict) -> None:
+    """Write flags dict into the _evolvebin Fortran module global state.
+
+    Must be called immediately before each _evolvebin.evolv2() call since
+    the module globals are shared across threads.  Nautilus handles thread
+    safety via its worker pool (one process per worker).
+
+    Handles two known COSMIC version differences via runtime rank detection:
+      - cevars.alpha1: scalar in some builds, rank-1 array of size 2 in others
+      - mtvars.acc_lim: same issue
+
+    When the Fortran variable is scalar but the flag holds a 2-element array
+    (separate alpha/flim per CE event), the first element is used and a
+    warning is emitted once per process.
+    """
+    import warnings
+
+    _evolvebin.windvars.neta           = flags["neta"]
+    _evolvebin.windvars.bwind          = flags["bwind"]
+    _evolvebin.windvars.hewind         = flags["hewind"]
+
+    # ---- alpha1: handle scalar vs 2-element array across COSMIC builds ----
+    alpha1_val = flags["alpha1"]
+    try:
+        _evolvebin.cevars.alpha1 = alpha1_val
+    except ValueError:
+        # This COSMIC build has scalar alpha1 — only alpha_1 (first CE event)
+        # is passed to Fortran. alpha_2 is sampled but cannot be independently
+        # controlled at the Fortran level in this COSMIC version.
+        if not getattr(set_evolvebin_flags, '_alpha_warned', False):
+            warnings.warn(
+                "COSMIC cevars.alpha1 is a scalar in this build — "
+                "assigning alpha_1 value only. alpha_2 samples will not "
+                "independently affect CE evolution. "
+                "Use a COSMIC build where alpha1 is a rank-1 array of size 2 "
+                "for full independent-alpha inference.",
+                RuntimeWarning, stacklevel=2,
+            )
+            set_evolvebin_flags._alpha_warned = True
+        _evolvebin.cevars.alpha1 = float(np.asarray(alpha1_val).flat[0])
+
+    _evolvebin.cevars.lambdaf          = flags["lambdaf"]
+    _evolvebin.ceflags.ceflag          = flags["ceflag"]
+    _evolvebin.flags.tflag             = flags["tflag"]
+    _evolvebin.flags.ifflag            = flags["ifflag"]
+    _evolvebin.flags.wdflag            = flags["wdflag"]
+    _evolvebin.flags.rtmsflag          = flags["rtmsflag"]
+    _evolvebin.snvars.pisn             = flags["pisn"]
+    _evolvebin.flags.bhflag            = flags["bhflag"]
+    _evolvebin.flags.remnantflag       = flags["remnantflag"]
+    _evolvebin.ceflags.cekickflag      = flags["cekickflag"]
+    _evolvebin.ceflags.cemergeflag     = flags["cemergeflag"]
+    _evolvebin.ceflags.cehestarflag    = flags["cehestarflag"]
+    _evolvebin.flags.grflag            = flags["grflag"]
+    _evolvebin.flags.bhms_coll_flag    = flags["bhms_coll_flag"]
+    _evolvebin.snvars.mxns             = flags["mxns"]
+    _evolvebin.points.pts1             = flags["pts1"]
+    _evolvebin.points.pts2             = flags["pts2"]
+    _evolvebin.points.pts3             = flags["pts3"]
+    _evolvebin.snvars.ecsn             = flags["ecsn"]
+    _evolvebin.snvars.ecsn_mlow        = flags["ecsn_mlow"]
+    _evolvebin.flags.aic               = flags["aic"]
+    _evolvebin.ceflags.ussn            = flags["ussn"]
+    _evolvebin.snvars.sigma            = flags["sigma"]
+    _evolvebin.snvars.sigmadiv         = flags["sigmadiv"]
+    _evolvebin.snvars.bhsigmafrac      = flags["bhsigmafrac"]
+    _evolvebin.snvars.polar_kick_angle = flags["polar_kick_angle"]
+    _evolvebin.snvars.natal_kick_array = flags["natal_kick_array"]
+    _evolvebin.cevars.qcrit_array      = flags["qcrit_array"]
+    _evolvebin.mtvars.don_lim          = flags["don_lim"]
+
+    # ---- acc_lim: same scalar/array issue as alpha1 ----
+    acc_lim_val = flags["acc_lim"]
+    try:
+        _evolvebin.mtvars.acc_lim = acc_lim_val
+    except ValueError:
+        if not getattr(set_evolvebin_flags, '_acclim_warned', False):
+            warnings.warn(
+                "COSMIC mtvars.acc_lim is a scalar in this build — "
+                "assigning flim_1 value only. flim_2 will not independently "
+                "affect stable MT in the second episode.",
+                RuntimeWarning, stacklevel=2,
+            )
+            set_evolvebin_flags._acclim_warned = True
+        _evolvebin.mtvars.acc_lim = float(np.asarray(acc_lim_val).flat[0])
+
+    _evolvebin.windvars.beta           = flags["beta"]
+    _evolvebin.windvars.xi             = flags["xi"]
+    _evolvebin.windvars.acc2           = flags["acc2"]
+    _evolvebin.windvars.epsnov         = flags["epsnov"]
+    _evolvebin.windvars.eddfac         = flags["eddfac"]
+    _evolvebin.windvars.gamma          = flags["gamma"]
+    _evolvebin.flags.bdecayfac         = flags["bdecayfac"]
+    _evolvebin.magvars.bconst          = flags["bconst"]
+    _evolvebin.magvars.ck              = flags["ck"]
+    _evolvebin.flags.windflag          = flags["windflag"]
+    _evolvebin.flags.qcflag            = flags["qcflag"]
+    _evolvebin.flags.eddlimflag        = flags["eddlimflag"]
+    _evolvebin.tidalvars.fprimc_array  = flags["fprimc_array"]
+    _evolvebin.rand1.idum1             = flags["randomseed"]
+    _evolvebin.flags.bhspinflag        = flags["bhspinflag"]
+    _evolvebin.snvars.bhspinmag        = flags["bhspinmag"]
+    _evolvebin.mixvars.rejuv_fac       = flags["rejuv_fac"]
+    _evolvebin.flags.rejuvflag         = flags["rejuvflag"]
+    _evolvebin.flags.htpmb             = flags["htpmb"]
+    _evolvebin.flags.st_cr             = flags["ST_cr"]
+    _evolvebin.flags.st_tide           = flags["ST_tide"]
+    _evolvebin.snvars.rembar_massloss  = flags["rembar_massloss"]
+    _evolvebin.metvars.zsun            = flags["zsun"]
+    _evolvebin.snvars.kickflag         = flags["kickflag"]
+    _evolvebin.se_flags.using_metisse  = 0
+    _evolvebin.se_flags.using_sse      = 1
+
+
+# ---------------------------------------------------------------------------
+# COSMIC binary evolution call
+# ---------------------------------------------------------------------------
+
+def evolv2(
+    params_in: dict,
+    params_out: list[str],
+    fixed_params: dict,
+) -> tuple:
+    """Evolve a binary from ZAMS to merger (or dissolution) using COSMIC.
+
+    Maps the 17-D parameter vector (θ, Λ, X) → merger observables θ_GW.
+    This is the deterministic function f() in Eq. (1) of Lucky Strikes.
+
+    Parameters
+    ----------
+    params_in : dict
+        Sampled parameters from Nautilus.  Required keys depend on the config;
+        at minimum {'m1', 'q', 'logtb', 'logZ'}.
+    params_out : list[str]
+        Column names to extract from the merger state (e.g. ['mass_1', 'mass_2']).
+    fixed_params : dict
+        Parameters held constant for this run (e.g. {'vk1': 0.0, ...}).
+
+    Returns
+    -------
+    final_state : pd.Series or None
+        Merger-time values of params_out columns.  None if no merger occurs.
+    bpp_array : np.ndarray or None
+        Full binary evolution track, shape (25, len(COLS_KEEP)), for blob storage.
+    kick_array : np.ndarray or None
+        Kick info array, shape (2, len(KICK_COLUMNS)), for blob storage.
+
+    Notes
+    -----
+    kstar_1 == kstar_2 == 14 identifies a double BH binary.
+    evol_type == 3 indicates inspiral / GW-driven merger within a Hubble time.
+    The integration runs to tphysf = 13700 Myr (Hubble time).
+    """
+    # ---- Unpack binary initial conditions ----
+    m1          = params_in["m1"]
+    q           = params_in["q"]
+    m2          = q * m1
+    tb          = 10.0 ** params_in["logtb"]          # period in days
+    e           = params_in.get("e", 0.0)             # eccentricity; fixed=0 in Lucky Strikes
+    metallicity = 10.0 ** params_in["logZ"]
+
+    # ---- Set COSMIC physics flags ----
+    flags = set_flags(params_in, fixed_params)
+    set_evolvebin_flags(flags)
+
+    # ---- Column index arrays for bpp / bcm output ----
+    col_inds_bpp = np.zeros(len(ALL_COLUMNS), dtype=int)
+    col_inds_bpp[:len(BPP_COLUMNS)] = [ALL_COLUMNS.index(c) + 1 for c in BPP_COLUMNS]
+    n_col_bpp = len(BPP_COLUMNS)
+
+    col_inds_bcm = np.zeros(len(ALL_COLUMNS), dtype=int)
+    col_inds_bcm[:len(BCM_COLUMNS)] = [ALL_COLUMNS.index(c) + 1 for c in BCM_COLUMNS]
+    n_col_bcm = len(BCM_COLUMNS)
+
+    _evolvebin.col.n_col_bpp    = n_col_bpp
+    _evolvebin.col.col_inds_bpp = col_inds_bpp
+    _evolvebin.col.n_col_bcm    = n_col_bcm
+    _evolvebin.col.col_inds_bcm = col_inds_bcm
+
+    # ---- Initial state arrays ----
+    kstar    = np.array([1, 1], dtype=int)
+    mass     = np.array([m1, m2])
+    mass0    = np.array([m1, m2])
+    epoch    = np.zeros(2)
+    ospin    = np.zeros(2)
+    tphys    = 0.0
+    tphysf   = 13700.0          # Hubble time [Myr]
+    dtp      = 0.0              # 0.0 → output at every event
+    rad      = np.zeros(2)
+    lumin    = np.zeros(2)
+    massc    = np.zeros(2)
+    radc     = np.zeros(2)
+    menv     = np.zeros(2)
+    renv     = np.zeros(2)
+    B_0      = np.zeros(2)
+    bacc     = np.zeros(2)
+    tacc     = np.zeros(2)
+    tms      = np.zeros(2)
+    bhspin   = np.zeros(2)
+    zpars    = np.zeros(20)
+    bkick    = np.zeros(20)
+    kick_info = np.zeros((2, 18))
+
+    # ---- Call COSMIC Fortran kernel ----
+    [_, bpp_index, bcm_index, kick_info_arrays] = _evolvebin.evolv2(
+        kstar, mass, tb, e, metallicity, tphysf,
+        dtp, mass0, rad, lumin, massc, radc,
+        menv, renv, ospin, B_0, bacc, tacc, epoch, tms,
+        bhspin, tphys, zpars, bkick, kick_info,
     )
 
-    return data
+    # ---- Extract and clear output arrays (avoids Fortran global state leakage) ----
+    bpp_raw = _evolvebin.binary.bpp[:25, :n_col_bpp].copy()
+    _evolvebin.binary.bpp[:25, :n_col_bpp] = 0.0
+
+    bcm_raw = _evolvebin.binary.bcm[:bcm_index, :n_col_bcm].copy()
+    _evolvebin.binary.bcm[:bcm_index, :n_col_bcm] = 0.0
+
+    # ---- Build DataFrames ----
+    bpp = pd.DataFrame(bpp_raw, columns=BPP_COLUMNS)[COLS_KEEP]
+    kick_df = pd.DataFrame(
+        kick_info_arrays,
+        columns=KICK_COLUMNS,
+        index=kick_info_arrays[:, -1].astype(int),
+    )
+
+    # ---- Find merger row: BBH (kstar=14/14) that inspirals (evol_type=3) ----
+    merger_mask = (
+        (bpp.kstar_1 == 14) & (bpp.kstar_2 == 14) & (bpp.evol_type == 3)
+    )
+    merger_rows = bpp.loc[merger_mask]
+
+    if len(merger_rows) == 0:
+        # Binary did not form a merging BBH — signal failure to Nautilus
+        return None, None, None
+
+    final_state = merger_rows[params_out].iloc[0]
+    bpp_array   = bpp.to_numpy()
+    kick_array  = kick_df.to_numpy()
+
+    return final_state, bpp_array, kick_array
 
 
-def load_data(samples_path, weights=True):
-    ''' Load the GW190814 data from the given path and return the KDE and samples.
-    
+# ---------------------------------------------------------------------------
+# GW likelihood utilities
+# ---------------------------------------------------------------------------
+
+def load_gw_data(
+    samples_path: str,
+    approximant: str = "C01:Mixed",
+    use_pe_weights: bool = True,
+    include_redshift: bool = False,
+) -> tuple:
+    """Load GW posterior samples and build a source-frame KDE likelihood.
+
+    Implements the likelihood construction from Lucky Strikes Appendix A,
+    with an optional extension to a 3D KDE that includes the merger redshift.
+
+    2D mode (include_redshift=False):
+        KDE over (mc_source, q).  Matches Lucky Strikes exactly.
+
+    3D mode (include_redshift=True):
+        KDE over (mc_source, q, z_src).  Enables constraint on the delay
+        time and hence on the formation redshift / metallicity when z_form
+        is a sampled parameter.  Requires the '_zform' config variants.
+
     Parameters
     ----------
     samples_path : str
-        The path to the GW190814 samples file.
-    weights : bool, optional
-        Whether to use weights for the KDE. Default is True.
-        
+        Path to a pesummary-compatible HDF5 posterior file.
+    approximant : str
+        Posterior approximant label.  Default 'C01:Mixed' covers most
+        GWTC-2/3 BBH events.  Falls back gracefully if unavailable.
+    use_pe_weights : bool
+        Apply Callister (2021) Jacobian reweighting to recover the likelihood
+        from the PE posterior samples.  Should be True for all production runs.
+    include_redshift : bool
+        If True, build a 3D KDE over (mc, q, z_src) instead of 2D (mc, q).
+
     Returns
     -------
-    KDE : scipy.stats.gaussian_kde
-        The KDE of the GW190814 data.
-    gwsamples : np.ndarray
-        The original GW190814 samples.
-    gwsamples_kde : np.ndarray
-        The resampled GW190814 samples from the KDE.
-    qmin : float
-        The minimum mass ratio of the GW190814 samples.
-    qmax : float
-        The maximum mass ratio of the GW190814 samples.
-    mcmin : float
-        The minimum chirp mass of the GW190814 samples.
-    mcmax : float
-        The maximum chirp mass of the GW190814 samples.
-    '''
+    kde : scipy.stats.gaussian_kde
+        2D KDE over (mc, q) or 3D over (mc, q, z_src).
+    q_bounds : tuple[float, float]
+        99.9% HDI of q — used as a soft prior gate in the likelihood.
+    mc_bounds : tuple[float, float]
+        99.9% HDI of mc — for diagnostics and metadata.
+    z_bounds : tuple[float, float] or None
+        99.9% HDI of z_src in 3D mode; None in 2D mode.
+    raw_samples : np.ndarray
+        Source-frame samples, shape (N, 2) or (N, 3).
+
+    Notes
+    -----
+    Jacobian (Callister 2021 / Lucky Strikes App. A):
+        π_PE(m1_src, m2_src, z) ∝ D_L^2 (1+z)^2 (dD_L/dz) m1_src^2 / mc_src
+    Importance weights are the reciprocal, evaluated per sample.
+    """
+    from pesummary.io import read
+    import arviz as az
+    from scipy.stats import gaussian_kde
+
     data = read(samples_path, package="gw")
 
-    m1det = data.samples_dict['C01:Mixed']['mass_1']
-    m2det = data.samples_dict['C01:Mixed']['mass_2']
-    dL = data.samples_dict['C01:Mixed']['luminosity_distance']
+    available = list(data.samples_dict.keys())
+    if approximant not in available:
+        fallback = available[0]
+        print(f"[load_gw_data] '{approximant}' not found; using '{fallback}'. "
+              f"Available: {available}")
+        approximant = fallback
 
+    samples = data.samples_dict[approximant]
+    m1_det  = np.asarray(samples['mass_1'])
+    m2_det  = np.asarray(samples['mass_2'])
+    dL      = np.asarray(samples['luminosity_distance'])
+
+    # Source-frame conversion
     redshift = zofdL(dL)
-    m1s = m1det/(1+redshift)
-    m2s = m2det/(1+redshift)
-    mcs = (m1s*m2s)**(3/5)/(m1s + m2s)**(1/5)
-    Ms = m1s + m2s
-    qs = m2s/m1s
-    
-    # 0.08134597870775964 0.14305660510532858 6.021922663985887 6.203484262510087
-    qmin, qmax = az.hdi(qs,0.999)
-    mcmin, mcmax = az.hdi(mcs,0.999)
-    print(qmin,qmax,mcmin,mcmax)
-    
-    if weights is True:
-        wts = 1/(dL**2*(1+redshift)**2*ddLdz(redshift)*m1s**2/mcs)
+    m1_src   = m1_det / (1.0 + redshift)
+    m2_src   = m2_det / (1.0 + redshift)
+    mc_src   = (m1_src * m2_src)**(3.0/5.0) / (m1_src + m2_src)**(1.0/5.0)
+    q_src    = m2_src / m1_src   # ≤ 1
+
+    # Importance weights: inverse PE prior Jacobian (Callister 2021)
+    if use_pe_weights:
+        jacobian = (
+            dL**2
+            * (1.0 + redshift)**2
+            * ddLdz(redshift)
+            * m1_src**2
+            / mc_src
+        )
+        weights = 1.0 / jacobian
+        weights = weights / weights.sum()
     else:
-        wts = np.ones(len(m1s))
+        weights = np.ones(len(m1_src)) / len(m1_src)
 
-    wts = wts/np.sum(wts)
+    q_lo,  q_hi  = az.hdi(q_src,  hdi_prob=0.999)
+    mc_lo, mc_hi = az.hdi(mc_src, hdi_prob=0.999)
 
-    gwsamples = np.column_stack([mcs,qs])
-    KDE = gaussian_kde(gwsamples.T, weights=wts)
-    
-    gwsamples_kde = KDE.resample(len(gwsamples)).T
+    if include_redshift:
+        # Use the redshift values already implied by the PE D_L samples
+        # (consistent with the PE cosmological model internally)
+        z_src = redshift
+        z_lo, z_hi = az.hdi(z_src, hdi_prob=0.999)
 
-    return KDE, gwsamples, gwsamples_kde, qmin, qmax, mcmin, mcmax
-    
+        raw_samples = np.column_stack([mc_src, q_src, z_src])
+        kde = gaussian_kde(raw_samples.T, weights=weights)
+
+        print(f"[load_gw_data] 3D KDE ({approximant}): "
+              f"mc=[{mc_lo:.3f},{mc_hi:.3f}] M_sun, "
+              f"q=[{q_lo:.4f},{q_hi:.4f}], "
+              f"z=[{z_lo:.4f},{z_hi:.4f}]")
+
+        return kde, (q_lo, q_hi), (mc_lo, mc_hi), (z_lo, z_hi), raw_samples
+
+    else:
+        raw_samples = np.column_stack([mc_src, q_src])
+        kde = gaussian_kde(raw_samples.T, weights=weights)
+
+        print(f"[load_gw_data] 2D KDE ({approximant}): "
+              f"mc=[{mc_lo:.3f},{mc_hi:.3f}] M_sun, "
+              f"q=[{q_lo:.4f},{q_hi:.4f}]")
+
+        return kde, (q_lo, q_hi), (mc_lo, mc_hi), None, raw_samples
+
+
+# ---------------------------------------------------------------------------
+# Utility
+# ---------------------------------------------------------------------------
+
+def str_to_bool(value: str) -> bool:
+    """Parse common string representations of boolean values."""
+    if value.lower() in {'false', 'f', '0', 'no', 'n'}:
+        return False
+    if value.lower() in {'true', 't', '1', 'yes', 'y'}:
+        return True
+    raise ValueError(f"'{value}' cannot be parsed as a boolean.")

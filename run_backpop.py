@@ -1,138 +1,498 @@
-import numpy as np
-import time
+"""
+run_backpop.py
+--------------
+Single-event BackPop inference with Nautilus nested sampling.
 
-from scipy.stats import gaussian_kde
+Two likelihood modes, selectable via --use_redshift_likelihood:
+
+  2D mode (default, --use_redshift_likelihood False):
+    KDE over (mc, q).  Matches Lucky Strikes exactly.  logZ has a flat prior.
+
+  3D mode (--use_redshift_likelihood True):
+    KDE over (mc, q, z_merger_predicted).
+    Adds z_form as a sampled parameter and applies:
+      - P(z_form): SFR-weighted comoving volume prior (Madau & Dickinson 2014)
+      - P(logZ | z_form): truncated Normal centred on the mean metallicity
+        at z_form with sigma = 0.5 dex  (Andrews+2021 Eqs. 6-8)
+    z_merger_predicted is computed from COSMIC's t_delay + z_form using
+    the Planck15 lookback-time relation.
+    Requires a '_zform' config variant.
+
+Usage
+-----
+    # 2D (default):
+    python run_backpop.py \\
+        --samples_path /path/to/GW150914.h5 \\
+        --event_name GW150914 \\
+        --config_name lucky_strikes_fixed_vk1
+
+    # 3D with cosmological prior:
+    python run_backpop.py \\
+        --samples_path /path/to/GW190814.h5 \\
+        --event_name GW190814 \\
+        --config_name lucky_strikes_zform \\
+        --use_redshift_likelihood True \\
+        --nlive 3000 --neff 30000
+
+Output (./results/<event_name>/<config_name>/):
+    points.npy     — posterior samples (N_eff, N_dim)
+    log_w.npy      — log importance weights
+    log_l.npy      — log likelihoods
+    log_z.npy      — log evidence (scalar); used in hierarchical step
+    blobs.npy      — COSMIC bpp + kick tracks per sample
+    metadata.npz   — self-describing run metadata for hierarchical step
+"""
+
+from __future__ import annotations
 
 import os
+import time
+import numpy as np
 from argparse import ArgumentParser
-import glob
+from functools import partial
 
-from scipy.stats import multivariate_normal
-from scipy.interpolate import interp1d
-
-import h5py
-from astropy.cosmology import Planck15, FlatLambdaCDM, z_at_value
-from astropy import units as u
-import astropy.constants as constants
-from pesummary.io import read
-from backpop import *
-from tqdm import tqdm
 from nautilus import Prior, Sampler
 
+from backpop import (
+    get_backpop_config,
+    load_gw_data,
+    evolv2,
+    str_to_bool,
+    BPP_SHAPE,
+    KICK_SHAPE,
+    COLS_KEEP,
+)
+from cosmo_prior import (
+    log_prior_z_form,
+    log_prior_logZ_given_z,
+    z_merger_from_t_delay,
+)
 
-# split out rv with KDE if you have GW samples
-def likelihood(KDE, params_out, qmax, fixed_params, params_in):
-    # evolve the binary
-    result = evolv2(params_in, params_out, fixed_params)
-    # check result
-    if result[0] is None:
-        return -np.inf, np.full(np.prod(BPP_SHAPE), np.nan, dtype=float), np.full(np.prod(KICK_SHAPE), np.nan, dtype=float)
 
-    # flatten arrays and force dtype
-    bpp_flat = np.array(result[1], dtype=float).ravel()
-    kick_flat = np.array(result[2], dtype=float).ravel()
-    
-    # check shapes
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+def _nan_blobs() -> tuple[np.ndarray, np.ndarray]:
+    """Sentinel NaN blobs for failed COSMIC calls."""
+    return (
+        np.full(np.prod(BPP_SHAPE),  np.nan, dtype=float),
+        np.full(np.prod(KICK_SHAPE), np.nan, dtype=float),
+    )
+
+
+def _flatten_blobs(bpp_raw, kick_raw) -> tuple[np.ndarray, np.ndarray] | None:
+    """Flatten and validate COSMIC output arrays for Nautilus blob storage."""
+    try:
+        bpp_flat  = np.asarray(bpp_raw,  dtype=float).ravel()
+        kick_flat = np.asarray(kick_raw, dtype=float).ravel()
+    except (TypeError, ValueError):
+        return None
     if bpp_flat.size != np.prod(BPP_SHAPE) or kick_flat.size != np.prod(KICK_SHAPE):
-        return -np.inf, np.full(np.prod(BPP_SHAPE), np.nan, dtype=float), np.full(np.prod(KICK_SHAPE), np.nan, dtype=float)
-    
-    m1 = result[0]['mass_1']
-    m2 = result[0]['mass_2']
-    q = np.where(m2 <= m1, m2/m1, m1/m2)  # Ensure q is defined only when m2 <= m1
-    mc = (m1*m2)**(3/5)/(m1 + m2)**(1/5)
-    Mtot = m1+m2
-    if (q < qmax):
-        gw_coord = np.array([mc, q])
-        ll = KDE.logpdf(gw_coord)
-        return (ll[0], bpp_flat, kick_flat)
+        return None
+    return bpp_flat, kick_flat
+
+
+def _merger_observables(final_state) -> tuple[float, float, float]:
+    """Compute (m1, m2, mc, q) from COSMIC final state with m1 >= m2."""
+    m1 = float(final_state['mass_1'])
+    m2 = float(final_state['mass_2'])
+    if m1 < m2:
+        m1, m2 = m2, m1
+    q  = m2 / m1
+    mc = (m1 * m2)**(3.0/5.0) / (m1 + m2)**(1.0/5.0)
+    return m1, m2, mc, q
+
+
+def _soft_q_gate(q: float, q_hi: float) -> float | None:
+    """Return a log-penalty if q exceeds the HDI upper limit, else None."""
+    if q > q_hi:
+        return -0.5 * ((q - q_hi) / 0.01)**2 - 100.0
+    return None
+
+
+def _extract_t_delay_myr(bpp_raw: np.ndarray) -> float | None:
+    """Extract COSMIC delay time (tphys at BBH merger row) in Myr."""
+    import pandas as pd
+    bpp = pd.DataFrame(bpp_raw, columns=COLS_KEEP)
+    merger = bpp.loc[
+        (bpp.kstar_1 == 14) & (bpp.kstar_2 == 14) & (bpp.evol_type == 3)
+    ]
+    if len(merger) == 0:
+        return None
+    return float(merger['tphys'].iloc[0])
+
+
+# ---------------------------------------------------------------------------
+# 2D likelihood: KDE over (mc, q) — Lucky Strikes mode
+# ---------------------------------------------------------------------------
+
+def likelihood_2d(
+    params_in: dict,
+    *,
+    kde,
+    q_bounds: tuple[float, float],
+    fixed_params: dict,
+) -> tuple[float, np.ndarray, np.ndarray]:
+    """Log-likelihood for the 2D (mc, q) KDE mode.
+
+    Calling convention: this function is pre-bound via functools.partial
+    and passed to Nautilus as a single-argument callable lhood(params_in).
+    The extra args (kde, q_bounds, fixed_params) are bound at construction
+    time as keyword arguments — Nautilus never sees them.  Do NOT pass this
+    function via Nautilus's likelihood_args= mechanism (which uses positional
+    partial and would reverse the argument order).
+
+    logZ has a flat Nautilus prior.  No cosmological constraints.
+    This is the mode used in Lucky Strikes (Magana Hernandez & Breivik 2025).
+
+    Parameters
+    ----------
+    params_in : dict
+        Nautilus sample — the sole positional argument Nautilus supplies.
+    kde : scipy.stats.gaussian_kde
+        2D KDE over (mc_src, q_src).  Bound via partial.
+    q_bounds : tuple[float, float]
+        (q_lo, q_hi) 99.9% HDI soft gate.  Bound via partial.
+    fixed_params : dict
+        Fixed COSMIC parameters.  Bound via partial.
+
+    Returns
+    -------
+    log_prob, bpp_flat, kick_flat
+    """
+    nan_bpp, nan_kick = _nan_blobs()
+
+    final_state, bpp_raw, kick_raw = evolv2(params_in, ['mass_1', 'mass_2'], fixed_params)
+    if final_state is None:
+        return -np.inf, nan_bpp, nan_kick
+
+    blobs = _flatten_blobs(bpp_raw, kick_raw)
+    if blobs is None:
+        return -np.inf, nan_bpp, nan_kick
+    bpp_flat, kick_flat = blobs
+
+    _, _, mc, q = _merger_observables(final_state)
+
+    penalty = _soft_q_gate(q, q_bounds[1])
+    if penalty is not None:
+        return penalty, bpp_flat, kick_flat
+
+    log_prob = float(kde.logpdf(np.array([[mc], [q]]))[0])
+    return log_prob, bpp_flat, kick_flat
+
+
+# ---------------------------------------------------------------------------
+# 3D likelihood: KDE over (mc, q, z_merger) + cosmological priors
+# ---------------------------------------------------------------------------
+
+def likelihood_3d(
+    params_in: dict,
+    *,
+    kde,
+    q_bounds: tuple[float, float],
+    z_bounds: tuple[float, float],
+    fixed_params: dict,
+) -> tuple[float, np.ndarray, np.ndarray]:
+    """Log-likelihood for the 3D (mc, q, z_merger) KDE mode.
+
+    Calling convention: pre-bound via functools.partial, passed to Nautilus
+    as a single-argument callable lhood(params_in).  Do NOT use Nautilus's
+    likelihood_args= mechanism — it applies positional partial which reverses
+    the argument order.
+
+    Total log-probability:
+        log p = log L_KDE(mc, q, z_merger_pred)
+              + log P(z_form)          [Andrews+2021 Eq. 5 - SFR prior]
+              + log P(logZ | z_form)   [Andrews+2021 Eq. 8 - metallicity prior]
+
+    Notes on the factorisation:
+      - z_form is sampled with a flat Nautilus prior over [1e-4, 20]; the
+        physical P(z_form) and P(logZ|z_form) terms are evaluated here.
+      - z_form is NOT passed to COSMIC; it enters only through the
+        delay-time → z_merger mapping and the metallicity prior.
+      - Cosmological priors evaluated before COSMIC for fast rejection.
+
+    Parameters
+    ----------
+    params_in : dict
+        Nautilus sample — must include 'z_form' and 'logZ'.
+    kde : scipy.stats.gaussian_kde
+        3D KDE over (mc_src, q_src, z_src).  Bound via partial.
+    q_bounds : tuple[float, float]
+        (q_lo, q_hi) 99.9% HDI soft gate.  Bound via partial.
+    z_bounds : tuple[float, float]
+        (z_lo, z_hi) 99.9% HDI of merger redshift.  Bound via partial.
+    fixed_params : dict
+        Fixed COSMIC parameters.  Bound via partial.
+
+    Returns
+    -------
+    log_prob, bpp_flat, kick_flat
+    """
+    nan_bpp, nan_kick = _nan_blobs()
+
+    z_form  = params_in.get('z_form')
+    log10_Z = params_in.get('logZ')
+
+    if z_form is None or log10_Z is None:
+        raise KeyError(
+            "likelihood_3d requires 'z_form' and 'logZ' in params_in. "
+            "Use a '_zform' config variant."
+        )
+
+    # ---- Cosmological priors (fast rejection before COSMIC) ----
+    lp_z = log_prior_z_form(z_form)
+    if not np.isfinite(lp_z):
+        return -np.inf, nan_bpp, nan_kick
+
+    lp_logZ = log_prior_logZ_given_z(log10_Z, z_form)
+    if not np.isfinite(lp_logZ):
+        return -np.inf, nan_bpp, nan_kick
+
+    # ---- COSMIC call (z_form stripped — not a COSMIC parameter) ----
+    cosmic_params = {k: v for k, v in params_in.items() if k != 'z_form'}
+    final_state, bpp_raw, kick_raw = evolv2(
+        cosmic_params, ['mass_1', 'mass_2'], fixed_params
+    )
+    if final_state is None:
+        return -np.inf, nan_bpp, nan_kick
+
+    blobs = _flatten_blobs(bpp_raw, kick_raw)
+    if blobs is None:
+        return -np.inf, nan_bpp, nan_kick
+    bpp_flat, kick_flat = blobs
+
+    # ---- Delay time ----
+    t_delay = _extract_t_delay_myr(bpp_raw)
+    if t_delay is None:
+        return -np.inf, nan_bpp, nan_kick
+
+    # ---- Predicted merger redshift ----
+    z_merger_pred = z_merger_from_t_delay(z_form, t_delay)
+    if z_merger_pred is None:
+        # Merges in the future or before formation
+        return -np.inf, nan_bpp, nan_kick
+
+    # ---- Merger observables ----
+    _, _, mc, q = _merger_observables(final_state)
+
+    # ---- Soft mass-ratio gate ----
+    penalty = _soft_q_gate(q, q_bounds[1])
+    if penalty is not None:
+        return penalty + lp_z + lp_logZ, bpp_flat, kick_flat
+
+    # ---- 3D KDE likelihood ----
+    # Allow a 3x margin above z_hi before applying a soft penalty, since
+    # the KDE bandwidth handles tails within the HDI naturally.
+    z_hi = z_bounds[1]
+    if z_merger_pred > 3.0 * z_hi:
+        log_ll = -0.5 * ((z_merger_pred - z_hi) / (0.1 * max(z_hi, 1e-3)))**2 - 10.0
     else:
-        return -np.inf, np.full(np.prod(BPP_SHAPE), np.nan, dtype=float), np.full(np.prod(KICK_SHAPE), np.nan, dtype=float)
+        coord  = np.array([[mc], [q], [z_merger_pred]])
+        log_ll = float(kde.logpdf(coord)[0])
+
+    log_prob = log_ll + lp_z + lp_logZ
+    return log_prob, bpp_flat, kick_flat
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+_VALID_CONFIGS_2D = [
+    "lucky_strikes",
+    "lucky_strikes_fixed_vk1",
+    "bbh_no_kicks",
+]
+_VALID_CONFIGS_3D = [
+    "lucky_strikes_zform",
+    "lucky_strikes_fixed_vk1_zform",
+    "bbh_no_kicks_zform",
+]
+
+
+def parse_args():
+    p = ArgumentParser(description="Single-event BackPop inference (Nautilus).")
+
+    p.add_argument("--samples_path", required=True,
+                   help="Path to pesummary HDF5 posterior file.")
+    p.add_argument("--event_name",   required=True,
+                   help="Event identifier (e.g. GW150914, GW190814).")
+    p.add_argument("--config_name",  required=True,
+                   choices=_VALID_CONFIGS_2D + _VALID_CONFIGS_3D,
+                   help="Parameter space config.  "
+                        "Use '*_zform' variants with --use_redshift_likelihood True.")
+    p.add_argument("--use_redshift_likelihood", type=str_to_bool, default=False,
+                   help="3D mode: include z_merger in KDE and apply Andrews+2021 "
+                        "cosmological priors P(z_form) and P(logZ|z_form).  "
+                        "Requires a '_zform' config.")
+    p.add_argument("--approximant",  default="C01:Mixed",
+                   help="Posterior approximant label in the pesummary file.")
+    p.add_argument("--use_pe_weights", type=str_to_bool, default=True,
+                   help="Apply Callister (2021) Jacobian reweighting to PE samples.")
+    p.add_argument("--nlive",  type=int, default=3000,
+                   help="Nautilus n_live.  3000 for hard events; 1000 for typical BBH.")
+    p.add_argument("--neff",   type=int, default=30000,
+                   help="Nautilus target effective sample size.")
+    p.add_argument("--resume", type=str_to_bool, default=False,
+                   help="Resume from existing Nautilus checkpoint.")
+    p.add_argument("--max_threads", type=int, default=None,
+                   help="Worker thread cap (default: min(2*ncores-2, 64)).")
+
+    return p.parse_args()
+
+
+def main():
+    start = time.time()
+    opts  = parse_args()
+
+    # ---- Validate config / mode consistency ----
+    use_z = opts.use_redshift_likelihood
+    if use_z and opts.config_name not in _VALID_CONFIGS_3D:
+        raise ValueError(
+            f"--use_redshift_likelihood True requires a '_zform' config. "
+            f"Got '{opts.config_name}'. Valid 3D configs: {_VALID_CONFIGS_3D}"
+        )
+    if not use_z and opts.config_name in _VALID_CONFIGS_3D:
+        raise ValueError(
+            f"Config '{opts.config_name}' requires --use_redshift_likelihood True. "
+            f"Valid 2D configs: {_VALID_CONFIGS_2D}"
+        )
+
+    # ---- Output directory ----
+    output_path = os.path.join("results", opts.event_name, opts.config_name)
+    os.makedirs(output_path, exist_ok=True)
+    checkpoint  = os.path.join(output_path, "checkpoint.hdf5")
+
+    mode_tag = "3D+cosmo" if use_z else "2D"
+    print(f"[run_backpop] Event:  {opts.event_name}")
+    print(f"[run_backpop] Config: {opts.config_name}  [{mode_tag}]")
+    print(f"[run_backpop] Output: {output_path}")
+
+    # ---- Load GW data ----
+    kde, q_bounds, mc_bounds, z_bounds, raw_samples = load_gw_data(
+        opts.samples_path,
+        approximant=opts.approximant,
+        use_pe_weights=opts.use_pe_weights,
+        include_redshift=use_z,
+    )
+
+    # ---- Build prior ----
+    lower_bound, upper_bound, params_in_names, fixed_params = get_backpop_config(
+        opts.config_name
+    )
+    prior = Prior()
+    for name, lo, hi in zip(params_in_names, lower_bound, upper_bound):
+        prior.add_parameter(name, dist=(lo, hi))
+
+    print(f"[run_backpop] Parameter space ({len(params_in_names)}-D):")
+    for name, lo, hi in zip(params_in_names, lower_bound, upper_bound):
+        print(f"  {name:<16s}  [{lo:.4g}, {hi:.4g}]")
+    if fixed_params:
+        print(f"[run_backpop] Fixed: {fixed_params}")
+
+    # ---- Thread count ----
+    n_cores   = len(os.sched_getaffinity(0))
+    n_threads = min(2 * n_cores - 2, 64)
+    if opts.max_threads is not None:
+        n_threads = min(n_threads, opts.max_threads)
+    n_threads = max(n_threads, 1)
+    print(f"[run_backpop] Threads: {n_threads} / {n_cores} cores")
+
+    # ---- Blob dtype ----
+    blob_dtype = [
+        ('bpp',       float, (np.prod(BPP_SHAPE),)),
+        ('kick_info', float, (np.prod(KICK_SHAPE),)),
+    ]
+
+    # ---- Bind likelihood with partial (Nautilus-version-safe) ----
+    # Using functools.partial rather than likelihood_args= avoids a version-
+    # dependent calling convention in Nautilus's multiprocessing pool where
+    # the params_dict and extra args can be unpacked in the wrong order.
+    # partial binds all extra args at construction time; Nautilus sees a
+    # single-argument callable: lhood(params_dict).  scipy KDE and plain
+    # dicts are both picklable so this works across worker processes.
+    if use_z:
+        lhood = partial(
+            likelihood_3d,
+            kde=kde,
+            q_bounds=q_bounds,
+            z_bounds=z_bounds,
+            fixed_params=fixed_params,
+        )
+    else:
+        lhood = partial(
+            likelihood_2d,
+            kde=kde,
+            q_bounds=q_bounds,
+            fixed_params=fixed_params,
+        )
+
+    # ---- Nautilus sampler ----
+    sampler = Sampler(
+        prior=prior,
+        likelihood=lhood,
+        n_live=opts.nlive,
+        pool=n_threads,
+        blobs_dtype=blob_dtype,
+        filepath=checkpoint,
+        resume=opts.resume,
+    )
+
+    sampler.run(n_eff=opts.neff, verbose=True, discard_exploration=True)
+
+    # ---- Extract posterior ----
+    points, log_w, log_l, blobs = sampler.posterior(return_blobs=True)
+    log_z   = sampler.log_z
+    weights = np.exp(log_w - log_z)
+    weights /= weights.sum()
+    n_eff_actual = int(1.0 / np.sum(weights**2))
+
+    print(f"[run_backpop] log Z        = {log_z:.3f}")
+    print(f"[run_backpop] N_eff actual = {n_eff_actual}")
+
+    # ---- Save ----
+    np.save(os.path.join(output_path, "points.npy"), points)
+    np.save(os.path.join(output_path, "log_w.npy"),  log_w)
+    np.save(os.path.join(output_path, "log_l.npy"),  log_l)
+    np.save(os.path.join(output_path, "log_z.npy"),  np.array([log_z]))
+    np.save(os.path.join(output_path, "blobs.npy"),  blobs)
+
+    # ---- Delete checkpoint (recovers ~1-2 GB per event) ----
+    # The checkpoint HDF5 is only needed for --resume. Once all outputs are
+    # saved successfully it is redundant. Delete immediately to avoid disk
+    # quota exhaustion when many events run in parallel.
+    if os.path.exists(checkpoint):
+        os.remove(checkpoint)
+        print(f"[run_backpop] Checkpoint deleted: {checkpoint}")
+
+    np.savez(
+        os.path.join(output_path, "metadata.npz"),
+        event_name              = opts.event_name,
+        config_name             = opts.config_name,
+        likelihood_mode         = mode_tag,
+        use_redshift_likelihood = use_z,
+        params_in               = params_in_names,
+        lower_bound             = lower_bound,
+        upper_bound             = upper_bound,
+        fixed_params_keys       = list(fixed_params.keys()),
+        fixed_params_values     = list(fixed_params.values()),
+        nlive                   = opts.nlive,
+        neff                    = opts.neff,
+        n_eff_actual            = n_eff_actual,
+        log_z                   = log_z,
+        q_bounds                = q_bounds,
+        mc_bounds               = mc_bounds,
+        z_bounds                = (
+            z_bounds if z_bounds is not None else np.array([np.nan, np.nan])
+        ),
+        wall_time_s             = time.time() - start,
+    )
+
+    elapsed = time.time() - start
+    print(f"[run_backpop] Done.  Wall time: {elapsed/3600:.2f} hr ({elapsed:.0f} s)")
+
 
 if __name__ == "__main__":
-    start = time.time()
-    print("Starting timer")
-
-    optp = ArgumentParser()
-    optp.add_argument("--samples_path", help="path to event run dir")
-    optp.add_argument("--event_name", help="name of event")
-    optp.add_argument('--config_name', help="configuration to use")
-    optp.add_argument("--weights", type=str_to_bool, nargs='?', const=False, default=True)
-    optp.add_argument("--nlive", type=int, default=3000)
-    optp.add_argument("--neff", type=int, default=10000)
-    optp.add_argument("--resume", type=str_to_bool, nargs='?', const=False, default=False)
-
-    opts = optp.parse_args()
-
-    samples_path = opts.samples_path
-    event_name = opts.event_name
-    config_name = opts.config_name
-    weights = opts.weights
-    resume = opts.resume
-    #weights = True
-    #resume = False
-    print(weights)
-    print(resume)
-
-    output_path = "./results/" + event_name + "/" + config_name + "/"
-    print(output_path)
-    try:
-        os.makedirs(output_path, exist_ok=False)
-    except:
-        print("Output directory already exists. Continuing...")
-        pass
-
-    cols_keep = ['tphys', 'mass_1', 'mass_2', 'massc_1', 'massc_2', 'menv_1', 'menv_2', 'kstar_1', 'kstar_2', 'porb', 'ecc', 'evol_type', 'rad_1', 'rad_2', 'lum_1', 'lum_2']
-    KICK_COLUMNS = ['star', 'disrupted', 'natal_kick', 'phi', 'theta', 'mean_anomaly',
-                    'delta_vsysx_1', 'delta_vsysy_1', 'delta_vsysz_1', 'vsys_1_total',
-                    'delta_vsysx_2', 'delta_vsysy_2', 'delta_vsysz_2', 'vsys_2_total',
-                    'theta_euler', 'phi_euler', 'psi_euler', 'randomseed']
-
-
-    params = labels_dict[config_name]
-    print(config_name)
-
-    lower_bound, upper_bound, params_in, fixed_params = get_backpop_config(config_name)
-
-    KDE, gwsamples, gwsamples_kde, qmin, qmax, mcmin, mcmax = load_data(samples_path, weights)
-    #qmax = max(qmax, 0.3)
-    print(f'qmax={qmax}, qmin={qmin}, mcmax={mcmax}, mcmin={mcmin}')
-    # Set up Nautilus prior
-    prior = Prior()
-    for i in range(len(params_in)):
-        prior.add_parameter(params_in[i], dist=(lower_bound[i], upper_bound[i]))
-
-    params_out=['mass_1', 'mass_2']
-    num_cores = int(len(os.sched_getaffinity(0)))
-    num_threads = int(2*num_cores-2)
-    #num_threads = 1
-    print("using multiprocessing with " + str(num_threads) + " threads")
-    
-    dtype = [('bpp', float, 25*len(cols_keep)), ('kick_info', float, 2*len(KICK_COLUMNS))]
-    n_live = opts.nlive
-    n_eff = opts.neff
-    sampler = Sampler(
-        prior=prior, 
-        likelihood=likelihood, 
-        n_live=n_live, 
-        pool=num_threads,
-        blobs_dtype=dtype,
-        filepath="./results/" + event_name + "/" + config_name + "/" + "checkpoint.hdf5",
-        resume=resume, 
-        likelihood_args=(KDE, params_out, qmax, fixed_params)
-)
-    sampler.run(n_eff=n_eff,verbose=True,discard_exploration=True)
-    
-    points, log_w, log_l, blobs = sampler.posterior(return_blobs=True)
-
-    log_z = sampler.log_z
-    dweights = np.exp(log_w - log_z)
-    dweights = dweights/np.sum(dweights)
-    
-    np.save(output_path + "points.npy", points)
-    np.save(output_path + "log_w.npy", log_w)
-    np.save(output_path + "log_l.npy", log_l)
-    np.save(output_path + "log_z.npy", log_z)
-    np.save(output_path + "blobs.npy", blobs)
-
-    end = time.time()
-    print("Execution time: " + str(end - start) + " seconds")
+    main()
