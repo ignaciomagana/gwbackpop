@@ -95,6 +95,7 @@ import time
 import glob
 import warnings
 import numpy as np
+import scipy.stats as sp_stats
 from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
 
 import jax.numpy as jnp
@@ -1245,7 +1246,6 @@ def main():
             # ---- Kick velocity PPD ----
             fig_vk, axes_vk = plt.subplots(1, 2, figsize=(11, 4))
             vk_grid = np.linspace(0, 500, 500)
-            from scipy.stats import maxwell as sp_maxwell
 
             for ax, key, title, color in zip(
                 axes_vk,
@@ -1257,7 +1257,7 @@ def main():
                 # PPD of vk: average Maxwell(sigma) over posterior sigma samples
                 ppd_vk = np.zeros_like(vk_grid)
                 for sig in sig_samples[:200]:
-                    ppd_vk += sp_maxwell.pdf(vk_grid, scale=sig)
+                    ppd_vk += sp_stats.maxwell.pdf(vk_grid, scale=sig)
                 ppd_vk /= min(200, len(sig_samples))
 
                 ax.plot(vk_grid, ppd_vk, color=color, linewidth=2,
@@ -1288,7 +1288,175 @@ def main():
     except Exception as e:
         print(f"  PPD plots skipped: {e}")
 
-    # ---- CE and flim parameter summary plots ----
+    # ---- Population distribution credible bands ----
+    # These curves are the actual implied population PDFs p(theta | data), not
+    # histograms of the hyperparameters that define those PDFs.
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    sns.set_style('ticks')
+
+    try:
+        def _prior_support(name, default_lo, default_hi):
+            """Return plotted support from available event/injection priors."""
+            lows, highs = [], []
+            for pidx_ev, lo_ev, hi_ev in zip(all_pidx, all_lo, all_hi):
+                if name in pidx_ev:
+                    idx_ev = pidx_ev[name]
+                    lows.append(float(lo_ev[idx_ev]))
+                    highs.append(float(hi_ev[idx_ev]))
+            if cosmic_raw is not None:
+                params_inj = list(cosmic_raw['params'])
+                if name in params_inj:
+                    idx_inj = params_inj.index(name)
+                    lows.append(float(cosmic_raw['lower_bound'][idx_inj]))
+                    highs.append(float(cosmic_raw['upper_bound'][idx_inj]))
+            if lows and highs:
+                lo_plot = max(lows)
+                hi_plot = min(highs)
+                if np.isfinite(lo_plot) and np.isfinite(hi_plot) and lo_plot < hi_plot:
+                    return lo_plot, hi_plot
+            return default_lo, default_hi
+
+        def _normalize_pdf(pdf, grid):
+            area = np.trapz(pdf, grid)
+            if np.isfinite(area) and area > 0.0:
+                return pdf / area
+            return pdf
+
+        def _distribution_band(draws, grid, pdf_fn):
+            pdf_draws = np.array([
+                _normalize_pdf(pdf_fn(draw), grid)
+                for draw in draws
+            ])
+            return np.percentile(pdf_draws, [2.5, 50.0, 97.5], axis=0)
+
+        rng_pop = np.random.default_rng(opts.seed + 20_001)
+        n_curve = min(1000, len(flat_samples))
+        idx_curve = rng_pop.choice(len(flat_samples), n_curve, replace=False)
+        curve_samples = flat_samples[idx_curve]
+
+        alpha1_lo, alpha1_hi = _prior_support('alpha_1', 1e-2, 30.0)
+        alpha2_lo, alpha2_hi = _prior_support('alpha_2', 1e-2, 30.0)
+        alpha1_grid = np.geomspace(max(alpha1_lo, 1e-6), alpha1_hi, 600)
+        alpha2_grid = np.geomspace(max(alpha2_lo, 1e-6), alpha2_hi, 600)
+        flim_grid = np.linspace(1e-4, 1.0 - 1e-4, 600)
+        vk1_lo, vk1_hi = _prior_support('vk1', 0.0, 500.0)
+        vk2_lo, vk2_hi = _prior_support('vk2', 0.0, 500.0)
+        vk1_grid = np.linspace(max(vk1_lo, 0.0), vk1_hi, 600)
+        vk2_grid = np.linspace(max(vk2_lo, 0.0), vk2_hi, 600)
+
+        dist_specs = [
+            dict(
+                grid=alpha1_grid,
+                pdf=lambda draw: sp_stats.lognorm.pdf(
+                    alpha1_grid,
+                    s=draw[POP_PARAM_NAMES.index('sig_logalpha1')],
+                    scale=np.exp(draw[POP_PARAM_NAMES.index('mu_logalpha1')]),
+                ),
+                xlabel=r'$\alpha_1$',
+                ylabel=r'$p(\alpha_1\mid\mathrm{data})$',
+                title=r'CE efficiency $\alpha_1$',
+                color='steelblue',
+                xscale='log',
+            ),
+            dict(
+                grid=alpha2_grid,
+                pdf=lambda draw: sp_stats.lognorm.pdf(
+                    alpha2_grid,
+                    s=draw[POP_PARAM_NAMES.index('sig_logalpha2')],
+                    scale=np.exp(draw[POP_PARAM_NAMES.index('mu_logalpha2')]),
+                ),
+                xlabel=r'$\alpha_2$',
+                ylabel=r'$p(\alpha_2\mid\mathrm{data})$',
+                title=r'CE efficiency $\alpha_2$',
+                color='darkorange',
+                xscale='log',
+            ),
+            dict(
+                grid=flim_grid,
+                pdf=lambda draw: sp_stats.beta.pdf(
+                    flim_grid,
+                    draw[POP_PARAM_NAMES.index('a_f1')],
+                    draw[POP_PARAM_NAMES.index('b_f1')],
+                ),
+                xlabel=r'$f_{\mathrm{lim},1}$',
+                ylabel=r'$p(f_{\mathrm{lim},1}\mid\mathrm{data})$',
+                title=r'Stable MT accretion limit $f_{\mathrm{lim},1}$',
+                color='seagreen',
+                xscale='linear',
+            ),
+            dict(
+                grid=flim_grid,
+                pdf=lambda draw: sp_stats.beta.pdf(
+                    flim_grid,
+                    draw[POP_PARAM_NAMES.index('a_f2')],
+                    draw[POP_PARAM_NAMES.index('b_f2')],
+                ),
+                xlabel=r'$f_{\mathrm{lim},2}$',
+                ylabel=r'$p(f_{\mathrm{lim},2}\mid\mathrm{data})$',
+                title=r'Stable MT accretion limit $f_{\mathrm{lim},2}$',
+                color='purple',
+                xscale='linear',
+            ),
+            dict(
+                grid=vk1_grid,
+                pdf=lambda draw: sp_stats.maxwell.pdf(
+                    vk1_grid,
+                    scale=draw[POP_PARAM_NAMES.index('sigma_v1')],
+                ),
+                xlabel=r'$v_{k,1}$ [km/s]',
+                ylabel=r'$p(v_{k,1}\mid\mathrm{data})$',
+                title=r'Natal kick $v_{k,1}$',
+                color='firebrick',
+                xscale='linear',
+            ),
+            dict(
+                grid=vk2_grid,
+                pdf=lambda draw: sp_stats.maxwell.pdf(
+                    vk2_grid,
+                    scale=draw[POP_PARAM_NAMES.index('sigma_v2')],
+                ),
+                xlabel=r'$v_{k,2}$ [km/s]',
+                ylabel=r'$p(v_{k,2}\mid\mathrm{data})$',
+                title=r'Natal kick $v_{k,2}$',
+                color='teal',
+                xscale='linear',
+            ),
+        ]
+
+        fig_pop, axes_pop = plt.subplots(3, 2, figsize=(12, 12))
+        for ax, spec in zip(axes_pop.flat, dist_specs):
+            pdf_lo, pdf_med, pdf_hi = _distribution_band(
+                curve_samples, spec['grid'], spec['pdf']
+            )
+            ax.plot(spec['grid'], pdf_med, color=spec['color'], linewidth=2,
+                    label='posterior median PDF')
+            ax.fill_between(spec['grid'], pdf_lo, pdf_hi,
+                            color=spec['color'], alpha=0.25,
+                            label='95% credible band')
+            ax.set_xscale(spec['xscale'])
+            ax.set_xlabel(spec['xlabel'], fontsize=12)
+            ax.set_ylabel(spec['ylabel'], fontsize=11)
+            ax.set_title(spec['title'], fontsize=12)
+            ax.legend(fontsize=8)
+            sns.despine(ax=ax)
+
+        fig_pop.suptitle(
+            f"Population distribution PDFs — {n_events} events  |  {opts.config_name}",
+            fontsize=12,
+        )
+        fig_pop.tight_layout()
+        pop_dist_path = os.path.join(out_dir, "population_distributions_95ci.pdf")
+        fig_pop.savefig(pop_dist_path, bbox_inches='tight', dpi=200)
+        plt.close(fig_pop)
+        print(f"  Pop PDFs:    {pop_dist_path} (n_curve={n_curve})")
+
+    except Exception as e:
+        print(f"  Population distribution plot skipped: {e}")
+
+    # ---- CE and flim hyperparameter summary plots ----
     try:
         import matplotlib
         matplotlib.use('Agg')
@@ -1321,7 +1489,7 @@ def main():
             sns.despine(ax=ax)
 
         fig_ce.suptitle(
-            f"CE efficiency and accretion posteriors — {n_events} events  |  {opts.config_name}",
+            f"CE efficiency and accretion hyperparameter posteriors — {n_events} events  |  {opts.config_name}",
             fontsize=12,
         )
         fig_ce.tight_layout()
