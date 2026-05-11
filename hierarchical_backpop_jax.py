@@ -188,6 +188,117 @@ def log_p_vk_jax(vk: jnp.ndarray, sigma_v: jnp.ndarray) -> jnp.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# NumPy population weight ratios for COSMIC merger-catalog postprocessing
+# ---------------------------------------------------------------------------
+
+def _maxwell_logpdf_numpy(x: np.ndarray, scale: float) -> np.ndarray:
+    """NumPy Maxwell log-PDF matching :func:`maxwell_logpdf`."""
+    x_safe = np.clip(np.asarray(x, dtype=np.float64), 1e-30, None)
+    scale = float(scale)
+    return (
+        0.5 * np.log(2.0 / np.pi)
+        + 2.0 * np.log(x_safe)
+        - 3.0 * np.log(scale)
+        - x_safe**2 / (2.0 * scale**2)
+    )
+
+
+def _lognormal_logpdf_numpy(x: np.ndarray, mu_log: float, sig_log: float) -> np.ndarray:
+    """NumPy LogNormal log-PDF with the same clipping as the JAX path."""
+    x_safe = np.clip(np.asarray(x, dtype=np.float64), 1e-30, None)
+    sig_log = float(sig_log)
+    return (
+        -np.log(x_safe)
+        -np.log(sig_log)
+        -0.5 * np.log(2.0 * np.pi)
+        -0.5 * ((np.log(x_safe) - float(mu_log)) / sig_log) ** 2
+    )
+
+
+def _beta_logpdf_numpy(x: np.ndarray, a: float, b: float) -> np.ndarray:
+    """NumPy Beta log-PDF with the same clipping as the JAX path."""
+    import math
+
+    x_safe = np.clip(np.asarray(x, dtype=np.float64), 1e-6, 1.0 - 1e-6)
+    a = float(a)
+    b = float(b)
+    log_norm = math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
+    return log_norm + (a - 1.0) * np.log(x_safe) + (b - 1.0) * np.log1p(-x_safe)
+
+
+def compute_log_wr_injections_numpy(
+    lp_vec: np.ndarray,
+    theta: np.ndarray,
+    params: list[str] | tuple[str, ...] | dict[str, int],
+    lo: np.ndarray,
+    hi: np.ndarray,
+    kick_sigma: float,
+) -> np.ndarray:
+    """Compute COSMIC injection log-weight ratios in NumPy.
+
+    This mirrors the COSMIC-merger weighting inside :func:`make_log_alpha_fn`:
+    LogNormal population densities for ``alpha_1``/``alpha_2``, Beta densities
+    for ``flim_1``/``flim_2``, and Maxwell densities for ``vk1``/``vk2``.  The
+    denominator is the COSMIC injection proposal: uniform over the CE and flim
+    parameters, and the Maxwell kick proposal with scale ``kick_sigma`` for the
+    kick velocities.
+    """
+    theta = np.asarray(theta, dtype=np.float64)
+    lo = np.asarray(lo, dtype=np.float64)
+    hi = np.asarray(hi, dtype=np.float64)
+    lp_vec = np.asarray(lp_vec, dtype=np.float64)
+
+    if isinstance(params, dict):
+        param_idx = params
+    else:
+        param_idx = {p: i for i, p in enumerate(params)}
+
+    mu_la1, sig_la1 = lp_vec[0], lp_vec[1]
+    mu_la2, sig_la2 = lp_vec[2], lp_vec[3]
+    af1,    bf1     = lp_vec[4], lp_vec[5]
+    af2,    bf2     = lp_vec[6], lp_vec[7]
+    sv1,    sv2     = lp_vec[8], lp_vec[9]
+
+    log_wr = np.zeros(theta.shape[0], dtype=np.float64)
+
+    def _col(name: str) -> np.ndarray | None:
+        idx = param_idx.get(name)
+        return theta[:, idx] if idx is not None else None
+
+    def _log_uniform_proposal(name: str) -> float:
+        idx = param_idx.get(name)
+        if idx is None:
+            return 0.0
+        return float(-np.log(hi[idx] - lo[idx]))
+
+    inj_a1 = _col('alpha_1')
+    if inj_a1 is not None:
+        log_wr += _lognormal_logpdf_numpy(inj_a1, mu_la1, sig_la1) - _log_uniform_proposal('alpha_1')
+
+    inj_a2 = _col('alpha_2')
+    if inj_a2 is not None:
+        log_wr += _lognormal_logpdf_numpy(inj_a2, mu_la2, sig_la2) - _log_uniform_proposal('alpha_2')
+
+    inj_f1 = _col('flim_1')
+    if inj_f1 is not None:
+        log_wr += _beta_logpdf_numpy(inj_f1, af1, bf1) - _log_uniform_proposal('flim_1')
+
+    inj_f2 = _col('flim_2')
+    if inj_f2 is not None:
+        log_wr += _beta_logpdf_numpy(inj_f2, af2, bf2) - _log_uniform_proposal('flim_2')
+
+    inj_v1 = _col('vk1')
+    if inj_v1 is not None:
+        log_wr += _maxwell_logpdf_numpy(inj_v1, sv1) - _maxwell_logpdf_numpy(inj_v1, kick_sigma)
+
+    inj_v2 = _col('vk2')
+    if inj_v2 is not None:
+        log_wr += _maxwell_logpdf_numpy(inj_v2, sv2) - _maxwell_logpdf_numpy(inj_v2, kick_sigma)
+
+    return log_wr
+
+
+# ---------------------------------------------------------------------------
 # Per-event weight ratio (fully JAX, JIT-compiled)
 # ---------------------------------------------------------------------------
 
@@ -1015,7 +1126,6 @@ def main():
         import matplotlib
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
-        import matplotlib.gridspec as gridspec
         import seaborn as sns
         sns.set_style('ticks')
 
@@ -1024,36 +1134,58 @@ def main():
             m2_cos = cosmic_raw['m2_src'].astype(np.float64)
             mc_cos = (m1_cos * m2_cos)**(3/5) / (m1_cos + m2_cos)**(1/5)
             q_cos  = m2_cos / m1_cos
+            theta_cos = cosmic_raw['theta'].astype(np.float64)
+            params_cos = list(cosmic_raw['params'])
+            lo_cos = cosmic_raw['lower_bound'].astype(np.float64)
+            hi_cos = cosmic_raw['upper_bound'].astype(np.float64)
+            kick_sigma_cos = float(
+                cosmic_raw['kick_proposal_sigma'].ravel()[0]
+                if 'kick_proposal_sigma' in cosmic_raw else 50.0
+            )
+
+            # Use the full COSMIC merger catalog when practical; otherwise use a
+            # single random, unbiased subsample for the PPD postprocessing cost.
+            rng_ppd = np.random.default_rng(opts.seed + 10_001)
+            n_catalog_ppd = min(len(mc_cos), 50_000)
+            if n_catalog_ppd < len(mc_cos):
+                idx_catalog_ppd = rng_ppd.choice(len(mc_cos), n_catalog_ppd, replace=False)
+                print(f"  PPD mass catalog: unbiased subsample "
+                      f"{n_catalog_ppd:,}/{len(mc_cos):,} COSMIC mergers")
+            else:
+                idx_catalog_ppd = np.arange(len(mc_cos))
+                print(f"  PPD mass catalog: full COSMIC merger catalog "
+                      f"({len(mc_cos):,} mergers)")
+
+            mc_cos_ppd = mc_cos[idx_catalog_ppd]
+            q_cos_ppd = q_cos[idx_catalog_ppd]
+            theta_cos_ppd = theta_cos[idx_catalog_ppd]
 
             # Subsample posterior for PPD computation (up to 200 samples)
             n_ppd  = min(200, len(flat_samples))
-            idx_ppd = np.random.choice(len(flat_samples), n_ppd, replace=False)
+            idx_ppd = rng_ppd.choice(len(flat_samples), n_ppd, replace=False)
 
             mc_ppd_all, q_ppd_all = [], []
+            draws_per_hyper = 200
             for lp in flat_samples[idx_ppd]:
-                lp_jax  = jnp.array(lp)
-                log_wr  = log_wr_fns[0](lp_jax)   # use first event's fn for shape
-                # Compute weights over COSMIC mergers
-                # Use injection weight ratio fn for population-level prediction
-                if log_alpha_fn is not None:
-                    log_wr_inj = log_alpha_fn.__closure__  # not accessible directly
-                # Simpler: weight COSMIC mergers directly from one event's fn
-                # using the injection theta
-                lp_vec_np  = np.asarray(lp)
-                lp_dict_   = dict(zip(POP_PARAM_NAMES, lp_vec_np))
-                # Recompute injection weight ratios in numpy for PPD
-                log_wr_inj = np.zeros(len(mc_cos))
-                a1 = float(lp_dict_['mu_logalpha1'])
-                s1 = float(lp_dict_['sig_logalpha1'])
-                # For PPD we use uniform weights — captures the COSMIC mass dist
-                # under the given population model via the injection weight ratios
-                # Simple approach: uniform weights (prior predictive over masses)
-                n_draw = min(500, len(mc_cos))
-                wr      = np.exp(log_wr_inj[:n_draw] - log_wr_inj[:n_draw].max())
-                wr     /= wr.sum()
-                idx_    = np.random.choice(n_draw, size=200, replace=True, p=wr)
-                mc_ppd_all.extend(mc_cos[:n_draw][idx_])
-                q_ppd_all.extend(q_cos[:n_draw][idx_])
+                log_wr_inj = compute_log_wr_injections_numpy(
+                    lp,
+                    theta_cos_ppd,
+                    params_cos,
+                    lo_cos,
+                    hi_cos,
+                    kick_sigma_cos,
+                )
+                log_wr_inj = log_wr_inj - np.max(log_wr_inj)
+                wr = np.exp(log_wr_inj)
+                wr_sum = wr.sum()
+                if not np.isfinite(wr_sum) or wr_sum <= 0.0:
+                    continue
+                wr /= wr_sum
+                idx_ = rng_ppd.choice(
+                    len(mc_cos_ppd), size=draws_per_hyper, replace=True, p=wr
+                )
+                mc_ppd_all.extend(mc_cos_ppd[idx_])
+                q_ppd_all.extend(q_cos_ppd[idx_])
 
             mc_ppd = np.array(mc_ppd_all)
             q_ppd  = np.array(q_ppd_all)
