@@ -456,18 +456,54 @@ def make_hierarchical_log_likelihood(
 def make_numpyro_model(log_likelihood_fn: callable) -> callable:
     """Wrap the hierarchical log-likelihood as a NumPyro model.
 
-    All 10 population parameters are sampled with flat (Uniform) priors
-    matching the bounds in POP_PARAMS. This is equivalent to treating the
-    likelihood as the posterior — the priors are intentionally uninformative.
-
-    The Uniform priors are implemented as constraints rather than explicit
-    prior terms, using numpyro.sample with dist.Uniform. This gives NUTS
-    the correct geometry for the bounded parameter space.
+    The population hyperparameters use explicit, weakly informative priors
+    chosen for each parameter type instead of flat priors over POP_PARAMS.
+    Keep POP_PARAM_NAMES order unchanged when packing the sampled values into
+    lp_vec, because downstream likelihood, output, and plotting code assume
+    that vector order.
     """
     def model():
         params = {}
-        for name, lo, hi in POP_PARAMS:
-            params[name] = numpyro.sample(name, dist.Uniform(lo, hi))
+        params["mu_logalpha1"] = numpyro.sample(
+            "mu_logalpha1",
+            dist.Normal(0.0, 1.5),
+        )
+        params["sig_logalpha1"] = numpyro.sample(
+            "sig_logalpha1",
+            dist.Exponential(1.0),
+        )
+        params["mu_logalpha2"] = numpyro.sample(
+            "mu_logalpha2",
+            dist.Normal(0.0, 1.5),
+        )
+        params["sig_logalpha2"] = numpyro.sample(
+            "sig_logalpha2",
+            dist.Exponential(1.0),
+        )
+        params["a_f1"] = numpyro.sample(
+            "a_f1",
+            dist.Gamma(2.0, 1.0),
+        )
+        params["b_f1"] = numpyro.sample(
+            "b_f1",
+            dist.Gamma(2.0, 1.0),
+        )
+        params["a_f2"] = numpyro.sample(
+            "a_f2",
+            dist.Gamma(2.0, 1.0),
+        )
+        params["b_f2"] = numpyro.sample(
+            "b_f2",
+            dist.Gamma(2.0, 1.0),
+        )
+        params["sigma_v1"] = numpyro.sample(
+            "sigma_v1",
+            dist.HalfNormal(150.0),
+        )
+        params["sigma_v2"] = numpyro.sample(
+            "sigma_v2",
+            dist.HalfNormal(150.0),
+        )
 
         # Pack into a single vector for the JIT-compiled likelihood
         lp_vec = jnp.array([params[name] for name in POP_PARAM_NAMES])
