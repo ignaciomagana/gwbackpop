@@ -282,8 +282,8 @@ def get_backpop_config(config_name: str) -> tuple[np.ndarray, np.ndarray, list[s
 
     # ---- Kick parameter ranges ----
     vk_range    = (0.0,  500.0)  # kick speed [km/s]
-    theta_range = (0.0,  360.0)  # polar kick angle [deg]
-    phi_range   = (-90.0, 90.0)  # azimuthal kick angle [deg]
+    theta_range = (0.0,  360.0)  # COSMIC kick azimuthal angle [deg]
+    phi_range   = (-90.0, 90.0)  # COSMIC kick co-lateral polar angle [deg]
     omega_range = (0.0,  360.0)  # orbital phase at SN [deg]
 
     # Helper to unpack range tuples into separate bound arrays
@@ -448,8 +448,8 @@ def _parse_kick_params(
 
     COSMIC natal_kick_array layout (per star):
         [0] vk        — kick speed [km/s]
-        [1] phi       — azimuthal kick angle [deg]
-        [2] theta     — polar kick angle [deg]
+        [1] phi       — co-lateral polar angle [deg], valid [-90, 90]
+        [2] theta     — azimuthal kick angle [deg], valid [0, 360]
         [3] omega     — mean anomaly at kick [deg]
         [4] reserved  — set to 0.0
 

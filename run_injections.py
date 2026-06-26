@@ -18,10 +18,11 @@ For each injection we:
 The weight ratio p(θ_j | Λ_pop) / q(θ_j) for each merging injection is:
   - α1, α2:    log-Normal / Uniform[0.1, 20]
   - flim1,2:   Beta(a,b)  / Uniform[0, 1]
-  - vk1, vk2:  Maxwell    / Uniform[0, 500]
+  - vk1, vk2:  Maxwell    / truncated Maxwell proposal on [0, 500]
+  - phi1,phi2: flat event prior / isotropic-direction proposal density
   - z_form:    1.0  (drew from SFR prior = population prior for z_form)
   - logZ:      1.0  (drew from P(logZ|z_form) = population prior for logZ)
-  - m1, q, logtb, angles: 1.0  (flat in both population and proposal)
+  - m1, q, logtb, theta, omega: 1.0  (flat in both population and proposal)
 
 This means InjectionCampaign.log_weight_ratio only touches the 6 binary
 physics dimensions, identical to EventPosterior.log_weight_ratio.
@@ -99,9 +100,9 @@ LOWER, UPPER, PARAMS, FIXED_PARAMS = _load_config(DEFAULT_CONFIG_NAME)
 # Choice: σ=50 km/s gives median kick ~63 km/s.  BH kicks from fallback
 # are typically O(10-100) km/s for massive progenitors (Fryer+2012, Mandel+2016).
 KICK_PROPOSAL_SIGMA: float = 50.0   # km/s  — Maxwellian scale parameter
-PROPOSAL_NAME = "zams_uniform_truncated_maxwell_aux_zform"
+PROPOSAL_NAME = "zams_uniform_truncated_maxwell_isotropic_kick_aux_zform"
 LIKELIHOOD_MODE = "2D"
-PROPOSAL_VERSION = "2"
+PROPOSAL_VERSION = "3"
 COORDINATE_SYSTEM = "backpop_zams_log10Z_zform_source_merger"
 
 # logZ drawn from P(logZ|z_form); bounds used only for rejection safeguard
@@ -141,8 +142,12 @@ def _run_one(seed: int) -> dict | None:
 
     # ---- Draw binary physics + ZAMS ----
     # Non-kick parameters: flat prior π₀ (uniform over LOWER, UPPER)
-    # Kick speeds: Maxwellian(KICK_PROPOSAL_SIGMA) truncated to [0, 500]
-    # Kick angles: uniform — isotropic in population model anyway
+    # Kick speeds: Maxwellian(KICK_PROPOSAL_SIGMA) truncated to [0, 500].
+    # Kick directions: isotropic in COSMIC convention.  COSMIC expects
+    # natal_kick_array=[vk, phi, theta, omega, rand_seed], where phi is the
+    # co-latitude/elevation-like polar angle in [-90, 90] deg and theta is
+    # the azimuth in [0, 360] deg.  Isotropy therefore requires sin(phi), not
+    # phi itself, to be uniform; theta and omega are uniform.
     # Rationale: uniform [0,500] km/s gives f_merge ≈ 0 because most kicks
     # disrupt the binary.  Maxwellian concentrates where mergers occur
     # while maintaining support over the full [0,500] range.
@@ -159,6 +164,10 @@ def _run_one(seed: int) -> dict | None:
             )
             # Reflect truncation into theta for storage.
             theta[i_kick] = params_dict[kick_name]
+
+    # Overwrite kick angles with isotropic directions in COSMIC convention.
+    for suffix in ("1", "2"):
+        _draw_and_store_kick_direction(rng, params_dict, theta, suffix)
 
     # ---- Draw auxiliary formation redshift and metallicity ----
     # 2D selection uses z_form only as a COSMIC/redshift auxiliary variable and
@@ -252,21 +261,88 @@ def _draw_truncated_maxwell(
     scale: float,
     lower: float,
     upper: float,
-    max_tries: int = 10_000,
 ) -> float:
-    """Draw from Maxwell(scale) conditioned on lower <= vk <= upper."""
-    for _ in range(max_tries):
-        vk = float(maxwell.rvs(scale=scale, random_state=rng))
-        if lower <= vk <= upper:
-            return vk
-    raise RuntimeError("Failed to draw truncated Maxwell kick speed")
+    """Draw exactly from Maxwell(scale) conditioned on lower <= vk <= upper.
+
+    Uses inverse-CDF sampling between the two truncation CDF values, avoiding
+    both clipping (which creates a point mass at the boundary) and rejection
+    failures for narrow or far-tail intervals.
+    """
+    cdf_lower = maxwell.cdf(lower, scale=scale)
+    cdf_upper = maxwell.cdf(upper, scale=scale)
+    if not cdf_upper > cdf_lower:
+        raise ValueError("Invalid truncated Maxwell interval or scale")
+    u = rng.uniform(cdf_lower, cdf_upper)
+    return float(maxwell.ppf(u, scale=scale))
 
 
 def _truncated_maxwell_logpdf(x: float | np.ndarray, scale: float, lower: float, upper: float) -> float | np.ndarray:
     """Log density of Maxwell(scale) truncated to [lower, upper]."""
     norm = maxwell.cdf(upper, scale=scale) - maxwell.cdf(lower, scale=scale)
-    return maxwell.logpdf(x, scale=scale) - np.log(norm)
+    logpdf = maxwell.logpdf(x, scale=scale) - np.log(norm)
+    return np.where((lower <= x) & (x <= upper) & (norm > 0.0), logpdf, -np.inf)
 
+
+
+def _draw_and_store_kick_direction(
+    rng: np.random.Generator,
+    params_dict: dict,
+    theta: np.ndarray,
+    suffix: str,
+) -> None:
+    """Draw one isotropic COSMIC kick direction and store sampled params.
+
+    COSMIC's explicit natal-kick columns are [vk, phi, theta, omega, rand_seed],
+    with phi valid on [-90, 90] deg and theta valid on [0, 360] deg.  Uniform
+    phi is not isotropic; an isotropic direction has sin(phi) ~ Uniform[-1, 1].
+    The orbital phase omega is not part of the direction and remains uniform.
+    """
+    phi_name = f"phi{suffix}"
+    theta_name = f"theta{suffix}"
+    omega_name = f"omega{suffix}"
+
+    if phi_name in PARAMS:
+        i_phi = PARAMS.index(phi_name)
+        sin_phi_lo = np.sin(np.deg2rad(LOWER[i_phi]))
+        sin_phi_hi = np.sin(np.deg2rad(UPPER[i_phi]))
+        sin_phi = rng.uniform(sin_phi_lo, sin_phi_hi)
+        phi = float(np.rad2deg(np.arcsin(sin_phi)))
+        params_dict[phi_name] = phi
+        theta[i_phi] = phi
+
+    # The COSMIC azimuth is named ``theta`` in natal_kick_array.  It is uniform
+    # for an isotropic direction, so the initial box draw is already correct.
+    for name in (theta_name, omega_name):
+        if name in PARAMS:
+            params_dict[name] = float(theta[PARAMS.index(name)])
+
+
+def _isotropic_phi_logpdf(phi_deg: float | np.ndarray, lower: float, upper: float) -> float | np.ndarray:
+    """Log PDF for phi when sin(phi) is uniform over the configured bounds."""
+    phi = np.asarray(phi_deg, dtype=np.float64)
+    sin_lo = np.sin(np.deg2rad(lower))
+    sin_hi = np.sin(np.deg2rad(upper))
+    norm = sin_hi - sin_lo
+    density = (np.pi / 180.0) * np.cos(np.deg2rad(phi)) / norm
+    out = np.where((lower <= phi) & (phi <= upper) & (density > 0.0), np.log(density), -np.inf)
+    return float(out) if out.ndim == 0 else out
+
+
+def sample_kick_directions_for_diagnostic(
+    rng: np.random.Generator,
+    n: int,
+    phi_bounds: tuple[float, float] = (-90.0, 90.0),
+    theta_bounds: tuple[float, float] = (0.0, 360.0),
+) -> tuple[np.ndarray, np.ndarray]:
+    """Draw diagnostic COSMIC kick angles from the same isotropic law as injections."""
+    sin_phi = rng.uniform(
+        np.sin(np.deg2rad(phi_bounds[0])),
+        np.sin(np.deg2rad(phi_bounds[1])),
+        size=n,
+    )
+    phi = np.rad2deg(np.arcsin(sin_phi))
+    theta = rng.uniform(theta_bounds[0], theta_bounds[1], size=n)
+    return phi, theta
 
 def _log_q_z_form(z_form: float) -> float:
     """Log density of the SFR proposal actually sampled on [0, ZFORM_MAX]."""
@@ -301,6 +377,8 @@ def compute_log_q_proposal(
             return -np.inf
         if name in ("vk1", "vk2"):
             log_q += float(_truncated_maxwell_logpdf(theta[i], kick_sigma, LOWER[i], UPPER[i]))
+        elif name in ("phi1", "phi2"):
+            log_q += float(_isotropic_phi_logpdf(theta[i], LOWER[i], UPPER[i]))
         elif name == "logZ" and LIKELIHOOD_MODE == "3D":
             # 3D logZ is proposed from P(logZ | z_form), not uniformly.
             continue
@@ -397,6 +475,11 @@ def run_campaign(
     n_done  = 0
 
     print(f"[injections] n_inj={n_inj:,}  n_workers={n_workers}")
+    print(
+        f"[injections] WARNING: proposal_version={PROPOSAL_VERSION} uses "
+        "truncated Maxwellian kick speeds and isotropic COSMIC kick directions; "
+        "do not combine its log_q_proposal with older proposal versions."
+    )
     print(f"[injections] pdet: {pdet_path}")
     print(f"[injections] output: {output_path}")
     print()
