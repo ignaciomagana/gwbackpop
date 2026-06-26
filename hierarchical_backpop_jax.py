@@ -234,6 +234,8 @@ def compute_log_wr_injections_numpy(
     lo: np.ndarray,
     hi: np.ndarray,
     kick_sigma: float,
+    log_q_proposal: np.ndarray | None = None,
+    log_pop_static: np.ndarray | None = None,
 ) -> np.ndarray:
     """Compute COSMIC injection log-weight ratios in NumPy.
 
@@ -260,7 +262,14 @@ def compute_log_wr_injections_numpy(
     af2,    bf2     = lp_vec[6], lp_vec[7]
     sv1,    sv2     = lp_vec[8], lp_vec[9]
 
-    log_wr = np.zeros(theta.shape[0], dtype=np.float64)
+    if log_q_proposal is not None:
+        log_wr = (np.zeros(theta.shape[0], dtype=np.float64)
+                  if log_pop_static is None else np.asarray(log_pop_static, dtype=np.float64).copy())
+        log_wr -= np.asarray(log_q_proposal, dtype=np.float64)
+        explicit_q = True
+    else:
+        log_wr = np.zeros(theta.shape[0], dtype=np.float64)
+        explicit_q = False
 
     def _col(name: str) -> np.ndarray | None:
         idx = param_idx.get(name)
@@ -274,27 +283,27 @@ def compute_log_wr_injections_numpy(
 
     inj_a1 = _col('alpha_1')
     if inj_a1 is not None:
-        log_wr += _lognormal_logpdf_numpy(inj_a1, mu_la1, sig_la1) - _log_uniform_proposal('alpha_1')
+        log_wr += _lognormal_logpdf_numpy(inj_a1, mu_la1, sig_la1) - (0.0 if explicit_q else _log_uniform_proposal('alpha_1'))
 
     inj_a2 = _col('alpha_2')
     if inj_a2 is not None:
-        log_wr += _lognormal_logpdf_numpy(inj_a2, mu_la2, sig_la2) - _log_uniform_proposal('alpha_2')
+        log_wr += _lognormal_logpdf_numpy(inj_a2, mu_la2, sig_la2) - (0.0 if explicit_q else _log_uniform_proposal('alpha_2'))
 
     inj_f1 = _col('flim_1')
     if inj_f1 is not None:
-        log_wr += _beta_logpdf_numpy(inj_f1, af1, bf1) - _log_uniform_proposal('flim_1')
+        log_wr += _beta_logpdf_numpy(inj_f1, af1, bf1) - (0.0 if explicit_q else _log_uniform_proposal('flim_1'))
 
     inj_f2 = _col('flim_2')
     if inj_f2 is not None:
-        log_wr += _beta_logpdf_numpy(inj_f2, af2, bf2) - _log_uniform_proposal('flim_2')
+        log_wr += _beta_logpdf_numpy(inj_f2, af2, bf2) - (0.0 if explicit_q else _log_uniform_proposal('flim_2'))
 
     inj_v1 = _col('vk1')
     if inj_v1 is not None:
-        log_wr += _maxwell_logpdf_numpy(inj_v1, sv1) - _maxwell_logpdf_numpy(inj_v1, kick_sigma)
+        log_wr += _maxwell_logpdf_numpy(inj_v1, sv1) - (0.0 if explicit_q else _maxwell_logpdf_numpy(inj_v1, kick_sigma))
 
     inj_v2 = _col('vk2')
     if inj_v2 is not None:
-        log_wr += _maxwell_logpdf_numpy(inj_v2, sv2) - _maxwell_logpdf_numpy(inj_v2, kick_sigma)
+        log_wr += _maxwell_logpdf_numpy(inj_v2, sv2) - (0.0 if explicit_q else _maxwell_logpdf_numpy(inj_v2, kick_sigma))
 
     return log_wr
 
@@ -390,7 +399,9 @@ def make_log_alpha_fn(
     lo_inj:        jnp.ndarray,   # (N_params,) injection prior lower bounds
     hi_inj:        jnp.ndarray,   # (N_params,) injection prior upper bounds
     param_idx_inj: dict[str, int],# injection param name → column index
-    kick_sigma:    float,         # Maxwellian proposal sigma used in campaign
+    kick_sigma:    float,         # Maxwellian proposal sigma used in legacy campaigns
+    log_q_proposal: jnp.ndarray | None = None,  # explicit full proposal log-density
+    log_pop_static: jnp.ndarray | None = None,  # population factors not varied by Lambda
 ) -> callable:
     """Return a JIT-compiled function: lp_vec → log_alpha (scalar).
 
@@ -459,6 +470,19 @@ def make_log_alpha_fn(
     lpi0_a2 = _log_pi0_inj('alpha_2')
     lpi0_f1 = _log_pi0_inj('flim_1')
     lpi0_f2 = _log_pi0_inj('flim_2')
+    if log_q_proposal is None:
+        warnings.warn(
+            "Injection file lacks log_q_proposal; falling back to legacy proposal "
+            "reconstruction from bounds and kick_proposal_sigma.",
+            RuntimeWarning,
+        )
+        use_explicit_q = False
+        log_q = None
+        static_pop = None
+    else:
+        use_explicit_q = True
+        log_q = log_q_proposal
+        static_pop = jnp.zeros(theta_inj.shape[0]) if log_pop_static is None else log_pop_static
 
     # Kick denominator: Maxwellian (injection proposal), not uniform
     def _log_maxw(vk):
@@ -476,20 +500,37 @@ def make_log_alpha_fn(
         af2,    bf2     = lp_vec[6], lp_vec[7]
         sv1,    sv2     = lp_vec[8], lp_vec[9]
 
-        # Weight ratios for COSMIC mergers
-        log_wr = jnp.zeros(theta_inj.shape[0])
-        if inj_a1 is not None:
-            log_wr = log_wr + log_p_alpha_jax(inj_a1, mu_la1, sig_la1) - lpi0_a1
-        if inj_a2 is not None:
-            log_wr = log_wr + log_p_alpha_jax(inj_a2, mu_la2, sig_la2) - lpi0_a2
-        if inj_f1 is not None:
-            log_wr = log_wr + log_p_flim_jax(inj_f1, af1, bf1) - lpi0_f1
-        if inj_f2 is not None:
-            log_wr = log_wr + log_p_flim_jax(inj_f2, af2, bf2) - lpi0_f2
-        if inj_v1 is not None:
-            log_wr = log_wr + log_p_vk_jax(inj_v1, sv1) - _log_maxw(inj_v1)
-        if inj_v2 is not None:
-            log_wr = log_wr + log_p_vk_jax(inj_v2, sv2) - _log_maxw(inj_v2)
+        # Weight ratios for COSMIC mergers. New injection files carry the full
+        # proposal density q(theta), so use log p_pop(theta|Lambda)-log q.
+        # Legacy files reconstruct only the non-cancelling factors.
+        if use_explicit_q:
+            log_wr = static_pop - log_q
+            if inj_a1 is not None:
+                log_wr = log_wr + log_p_alpha_jax(inj_a1, mu_la1, sig_la1)
+            if inj_a2 is not None:
+                log_wr = log_wr + log_p_alpha_jax(inj_a2, mu_la2, sig_la2)
+            if inj_f1 is not None:
+                log_wr = log_wr + log_p_flim_jax(inj_f1, af1, bf1)
+            if inj_f2 is not None:
+                log_wr = log_wr + log_p_flim_jax(inj_f2, af2, bf2)
+            if inj_v1 is not None:
+                log_wr = log_wr + log_p_vk_jax(inj_v1, sv1)
+            if inj_v2 is not None:
+                log_wr = log_wr + log_p_vk_jax(inj_v2, sv2)
+        else:
+            log_wr = jnp.zeros(theta_inj.shape[0])
+            if inj_a1 is not None:
+                log_wr = log_wr + log_p_alpha_jax(inj_a1, mu_la1, sig_la1) - lpi0_a1
+            if inj_a2 is not None:
+                log_wr = log_wr + log_p_alpha_jax(inj_a2, mu_la2, sig_la2) - lpi0_a2
+            if inj_f1 is not None:
+                log_wr = log_wr + log_p_flim_jax(inj_f1, af1, bf1) - lpi0_f1
+            if inj_f2 is not None:
+                log_wr = log_wr + log_p_flim_jax(inj_f2, af2, bf2) - lpi0_f2
+            if inj_v1 is not None:
+                log_wr = log_wr + log_p_vk_jax(inj_v1, sv1) - _log_maxw(inj_v1)
+            if inj_v2 is not None:
+                log_wr = log_wr + log_p_vk_jax(inj_v2, sv2) - _log_maxw(inj_v2)
 
         # Numerically stable K @ w via pure_callback (numpy, system RAM).
         # K never enters XLA memory — pure_callback hides it from the allocator.
@@ -959,6 +1000,36 @@ def main():
 
         print(f"\n Loading COSMIC merger catalog: {opts.injections_path}")
         cosmic_raw = np.load(opts.injections_path, allow_pickle=True)
+        log_q_arr = None
+        log_pop_static_arr = None
+        if 'log_q_proposal' in cosmic_raw:
+            log_q_arr = cosmic_raw['log_q_proposal'].astype(np.float64)
+            if not np.all(np.isfinite(log_q_arr)):
+                raise ValueError("log_q_proposal contains non-finite values")
+            from cosmo_prior import log_prior_z_form, log_prior_logZ_given_z
+            theta_tmp = cosmic_raw['theta'].astype(np.float64)
+            params_tmp = list(cosmic_raw['params'])
+            lo_tmp = cosmic_raw['lower_bound'].astype(np.float64)
+            hi_tmp = cosmic_raw['upper_bound'].astype(np.float64)
+            pidx_tmp = {p: i for i, p in enumerate(params_tmp)}
+            log_pop_static_arr = np.zeros(theta_tmp.shape[0], dtype=np.float64)
+            for name in params_tmp:
+                if name not in ('alpha_1', 'alpha_2', 'flim_1', 'flim_2', 'vk1', 'vk2'):
+                    idx = pidx_tmp[name]
+                    log_pop_static_arr += -np.log(hi_tmp[idx] - lo_tmp[idx])
+            if 'z_form' in cosmic_raw and 'logZ' in cosmic_raw:
+                zf = cosmic_raw['z_form'].astype(np.float64)
+                lz = cosmic_raw['logZ'].astype(np.float64)
+                log_pop_static_arr += np.array([log_prior_z_form(z) for z in zf])
+                log_pop_static_arr += np.array([log_prior_logZ_given_z(zmet, z) for zmet, z in zip(lz, zf)])
+            else:
+                warnings.warn(
+                    "Injection file has log_q_proposal but lacks z_form/logZ; "
+                    "assuming cosmological proposal factors cancel.",
+                    RuntimeWarning,
+                )
+            print("  Using explicit log_q_proposal from COSMIC merger catalog")
+
         cosmic = dict(
             theta    = cosmic_raw['theta'].astype(np.float64),
             m1_src   = cosmic_raw['m1_src'].astype(np.float64),
@@ -973,6 +1044,8 @@ def main():
                 cosmic_raw['kick_proposal_sigma'].ravel()[0]
                 if 'kick_proposal_sigma' in cosmic_raw else 50.0
             ),
+            log_q_proposal = log_q_arr,
+            log_pop_static = log_pop_static_arr,
         )
         print(f"  N_merge={cosmic['N_merge']:,}  N_COSMIC={cosmic['N_inj']:,}  "
               f"f_merge={cosmic['N_merge']/cosmic['N_inj']:.4f}")
@@ -999,6 +1072,10 @@ def main():
             K_np, log_v, log_norm,
             theta_inj_jax, lo_inj_jax, hi_inj_jax,
             pidx_inj, cosmic['kick_sigma'],
+            (jnp.array(cosmic['log_q_proposal'])
+             if cosmic['log_q_proposal'] is not None else None),
+            (jnp.array(cosmic['log_pop_static'])
+             if cosmic['log_pop_static'] is not None else None),
         )
         print("  Selection effects: ENABLED (Farr estimator, JAX JIT)")
 
@@ -1181,6 +1258,10 @@ def main():
             mc_cos_ppd = mc_cos[idx_catalog_ppd]
             q_cos_ppd = q_cos[idx_catalog_ppd]
             theta_cos_ppd = theta_cos[idx_catalog_ppd]
+            log_q_cos_ppd = (cosmic['log_q_proposal'][idx_catalog_ppd]
+                             if cosmic is not None and cosmic.get('log_q_proposal') is not None else None)
+            log_pop_static_ppd = (cosmic['log_pop_static'][idx_catalog_ppd]
+                                  if cosmic is not None and cosmic.get('log_pop_static') is not None else None)
 
             # Subsample posterior for PPD computation (up to 200 samples)
             n_ppd  = min(200, len(flat_samples))
@@ -1196,6 +1277,8 @@ def main():
                     lo_cos,
                     hi_cos,
                     kick_sigma_cos,
+                    log_q_cos_ppd,
+                    log_pop_static_ppd,
                 )
                 log_wr_inj = log_wr_inj - np.max(log_wr_inj)
                 wr = np.exp(log_wr_inj)

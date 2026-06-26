@@ -91,13 +91,16 @@ UPPER = np.array([150, 1.0,  3.699, 20,  20,  1.0, 1.0, 500, 360,  90, 360, 500,
 # Choice: σ=50 km/s gives median kick ~63 km/s.  BH kicks from fallback
 # are typically O(10-100) km/s for massive progenitors (Fryer+2012, Mandel+2016).
 KICK_PROPOSAL_SIGMA: float = 50.0   # km/s  — Maxwellian scale parameter
+PROPOSAL_NAME = "zams_uniform_truncated_maxwell_sfr_logz"
+PROPOSAL_VERSION = "2"
+COORDINATE_SYSTEM = "backpop_zams_log10Z_zform_source_merger"
 
 # logZ drawn from P(logZ|z_form); bounds used only for rejection safeguard
 LOGZ_LO = np.log10(1e-4)
 LOGZ_HI = np.log10(0.03)
 
 # z_form drawn from SFR prior; upper limit where SFR is negligible
-ZFORM_MAX = 15.0
+ZFORM_MAX = 20.0
 
 
 # ---------------------------------------------------------------------------
@@ -127,7 +130,7 @@ def _run_one(seed: int) -> dict | None:
 
     # ---- Draw binary physics + ZAMS ----
     # Non-kick parameters: flat prior π₀ (uniform over LOWER, UPPER)
-    # Kick speeds: Maxwellian(KICK_PROPOSAL_SIGMA) clipped to [0, 500]
+    # Kick speeds: Maxwellian(KICK_PROPOSAL_SIGMA) truncated to [0, 500]
     # Kick angles: uniform — isotropic in population model anyway
     # Rationale: uniform [0,500] km/s gives f_merge ≈ 0 because most kicks
     # disrupt the binary.  Maxwellian concentrates where mergers occur
@@ -135,11 +138,10 @@ def _run_one(seed: int) -> dict | None:
     theta = rng.uniform(LOWER, UPPER)
     params_dict = dict(zip(PARAMS, theta))
 
-    # Overwrite vk1 and vk2 with Maxwellian draws (clip to prior range)
-    vk1_raw = maxwell.rvs(scale=KICK_PROPOSAL_SIGMA, random_state=rng)
-    vk2_raw = maxwell.rvs(scale=KICK_PROPOSAL_SIGMA, random_state=rng)
-    params_dict['vk1'] = float(np.clip(vk1_raw, 0.0, UPPER[PARAMS.index('vk1')]))
-    params_dict['vk2'] = float(np.clip(vk2_raw, 0.0, UPPER[PARAMS.index('vk2')]))
+    # Overwrite vk1 and vk2 with exactly truncated Maxwellian draws.
+    # Do not clip: clipping would create an atom at the upper bound.
+    params_dict['vk1'] = _draw_truncated_maxwell(rng, KICK_PROPOSAL_SIGMA, 0.0, UPPER[PARAMS.index('vk1')])
+    params_dict['vk2'] = _draw_truncated_maxwell(rng, KICK_PROPOSAL_SIGMA, 0.0, UPPER[PARAMS.index('vk2')])
     # Reflect truncation into theta for storage
     theta[PARAMS.index('vk1')] = params_dict['vk1']
     theta[PARAMS.index('vk2')] = params_dict['vk2']
@@ -158,6 +160,10 @@ def _run_one(seed: int) -> dict | None:
         return None
 
     params_dict['logZ'] = log10_Z
+
+    log_q_proposal = compute_log_q_proposal(theta, z_form, log10_Z, KICK_PROPOSAL_SIGMA)
+    if not np.isfinite(log_q_proposal):
+        return None
 
     # ---- Run COSMIC ----
     try:
@@ -215,7 +221,69 @@ def _run_one(seed: int) -> dict | None:
         z_merger   = z_merger,
         t_delay    = t_delay,
         pdet       = pdet,
+        log_q_proposal = log_q_proposal,
     )
+
+
+def _draw_truncated_maxwell(
+    rng: np.random.Generator,
+    scale: float,
+    lower: float,
+    upper: float,
+    max_tries: int = 10_000,
+) -> float:
+    """Draw from Maxwell(scale) conditioned on lower <= vk <= upper."""
+    for _ in range(max_tries):
+        vk = float(maxwell.rvs(scale=scale, random_state=rng))
+        if lower <= vk <= upper:
+            return vk
+    raise RuntimeError("Failed to draw truncated Maxwell kick speed")
+
+
+def _truncated_maxwell_logpdf(x: float | np.ndarray, scale: float, lower: float, upper: float) -> float | np.ndarray:
+    """Log density of Maxwell(scale) truncated to [lower, upper]."""
+    norm = maxwell.cdf(upper, scale=scale) - maxwell.cdf(lower, scale=scale)
+    return maxwell.logpdf(x, scale=scale) - np.log(norm)
+
+
+def _log_q_z_form(z_form: float) -> float:
+    """Log density of the SFR proposal actually sampled on [0, ZFORM_MAX]."""
+    from cosmo_prior import _prior_weight_grid, _zgrid
+
+    if z_form < 0.0 or z_form > ZFORM_MAX:
+        return -np.inf
+    mask = _zgrid <= ZFORM_MAX
+    z_norm_grid = np.concatenate([_zgrid[mask], np.array([ZFORM_MAX])])
+    w_norm_grid = np.concatenate([
+        _prior_weight_grid[mask],
+        np.array([np.interp(ZFORM_MAX, _zgrid, _prior_weight_grid)]),
+    ])
+    norm = np.trapezoid(w_norm_grid, z_norm_grid)
+    weight = np.interp(z_form, _zgrid, _prior_weight_grid, left=0.0, right=0.0)
+    return float(np.log(weight) - np.log(norm)) if weight > 0.0 and norm > 0.0 else -np.inf
+
+
+def compute_log_q_proposal(
+    theta: np.ndarray,
+    z_form: float,
+    log10_Z: float,
+    kick_sigma: float = KICK_PROPOSAL_SIGMA,
+) -> float:
+    """Log density of the full injection proposal used by this campaign."""
+    from cosmo_prior import log_prior_logZ_given_z
+
+    theta = np.asarray(theta, dtype=np.float64)
+    log_q = 0.0
+    for i, name in enumerate(PARAMS):
+        if name in ("vk1", "vk2"):
+            log_q += float(_truncated_maxwell_logpdf(theta[i], kick_sigma, LOWER[i], UPPER[i]))
+        else:
+            if not (LOWER[i] <= theta[i] <= UPPER[i]):
+                return -np.inf
+            log_q += float(-np.log(UPPER[i] - LOWER[i]))
+    log_q += float(_log_q_z_form(z_form))
+    log_q += float(log_prior_logZ_given_z(log10_Z, z_form))
+    return float(log_q)
 
 
 def _draw_z_form(rng: np.random.Generator, max_tries: int = 200) -> float | None:
@@ -265,6 +333,7 @@ def run_campaign(
     n_inj: int,
     n_workers: int,
     chunk_size: int = 500,
+    config_name: str | None = None,
 ) -> None:
     """Run the full injection campaign and save results.
 
@@ -336,6 +405,7 @@ def run_campaign(
     z_merger   = np.array([r['z_merger'] for r in results])
     t_delay    = np.array([r['t_delay']  for r in results])
     pdet       = np.array([r['pdet']     for r in results])
+    log_q_proposal = np.array([r['log_q_proposal'] for r in results])
 
     elapsed = time.time() - start
 
@@ -365,6 +435,7 @@ def run_campaign(
         z_merger     = z_merger,
         t_delay_myr  = t_delay,
         pdet         = pdet,
+        log_q_proposal = log_q_proposal,
         params       = PARAMS,
         lower_bound  = LOWER,
         upper_bound  = UPPER,
@@ -372,6 +443,10 @@ def run_campaign(
         N_merge              = np.array([n_merge]),
         N_workers            = np.array([n_workers]),
         kick_proposal_sigma  = np.array([KICK_PROPOSAL_SIGMA]),
+        proposal_name         = np.array([PROPOSAL_NAME]),
+        proposal_version      = np.array([PROPOSAL_VERSION]),
+        coordinate_system     = np.array([COORDINATE_SYSTEM]),
+        config_name           = np.array([config_name or ""]),
         wall_time_s          = np.array([elapsed]),
     )
     print(f"  Saved: {output_path}")
@@ -398,6 +473,8 @@ def parse_args():
                    help="Seeds per pool.map call (default 500).")
     p.add_argument("--dry_run",     type=str, default='False',
                    help="If True, run n_inj=10000 to estimate merger fraction only.")
+    p.add_argument("--config_name", default=None,
+                   help="Optional BackPop config name stored as injection metadata.")
     return p.parse_args()
 
 
@@ -416,6 +493,7 @@ def main():
         n_inj       = n,
         n_workers   = nw,
         chunk_size  = opts.chunk_size,
+        config_name  = opts.config_name,
     )
 
 
