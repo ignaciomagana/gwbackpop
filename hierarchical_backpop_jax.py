@@ -96,7 +96,7 @@ import glob
 import warnings
 import numpy as np
 import scipy.stats as sp_stats
-from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
+from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter, ArgumentTypeError
 
 import jax.numpy as jnp
 import jax.scipy as jsp
@@ -106,6 +106,18 @@ import numpyro
 import numpyro.distributions as dist
 from numpyro.infer import NUTS, MCMC
 from numpyro.diagnostics import print_summary, effective_sample_size, gelman_rubin
+
+
+def str2bool(value):
+    """Parse CLI booleans such as True/False, yes/no, and 1/0."""
+    if isinstance(value, bool):
+        return value
+    value = str(value).strip().lower()
+    if value in {"true", "t", "1", "yes", "y", "on"}:
+        return True
+    if value in {"false", "f", "0", "no", "n", "off"}:
+        return False
+    raise ArgumentTypeError(f"Expected a boolean value, got {value!r}")
 
 # ---------------------------------------------------------------------------
 # Population parameter bounds (must match hierarchical_backpop.py)
@@ -807,12 +819,122 @@ def load_event_data(
     )
 
 
-def load_lvk_injections(lvk_path: str, n_inj_total: int | None = None) -> dict:
-    """Load LVK found injection set — mirrors LVKInjectionCampaign._load_lvk_injections."""
+def _stringify_hdf5_attr(value) -> str:
+    """Return a compact printable representation of an HDF5 attribute."""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    if isinstance(value, np.ndarray):
+        if value.shape == ():
+            return _stringify_hdf5_attr(value.item())
+        return np.array2string(value, threshold=8, edgeitems=3)
+    return str(value)
+
+
+def _collect_hdf5_attrs(obj) -> dict[str, str]:
+    return {str(k): _stringify_hdf5_attr(v) for k, v in obj.attrs.items()}
+
+
+def print_lvk_hdf5_audit_attrs(f, grp) -> tuple[dict[str, str], dict[str, str], dict[str, dict[str, str]]]:
+    """Print root and injection-group metadata relevant to sampling_pdf audits."""
+    root_attrs = _collect_hdf5_attrs(f)
+    grp_attrs = _collect_hdf5_attrs(grp)
+    print("  LVK HDF5 root attributes:")
+    if root_attrs:
+        for key in sorted(root_attrs):
+            print(f"    {key}: {root_attrs[key]}")
+    else:
+        print("    (none)")
+    print("  LVK HDF5 injections group attributes:")
+    if grp_attrs:
+        for key in sorted(grp_attrs):
+            print(f"    {key}: {grp_attrs[key]}")
+    else:
+        print("    (none)")
+    dataset_attrs = {}
+    for name in ["mass1_source", "mass2_source", "redshift", "sampling_pdf"]:
+        if name in grp:
+            attrs = _collect_hdf5_attrs(grp[name])
+            dataset_attrs[name] = attrs
+            print(f"  LVK HDF5 injections/{name} dataset attributes:")
+            if attrs:
+                for key in sorted(attrs):
+                    print(f"    {key}: {attrs[key]}")
+            else:
+                print("    (none)")
+    return root_attrs, grp_attrs, dataset_attrs
+
+
+def validate_lvk_sampling_pdf_measure(f, grp) -> dict[str, object]:
+    """Audit whether LVK sampling_pdf metadata supports the assumed measure.
+
+    The Farr kernel below is evaluated in (log mass1_source, log mass2_source, z).
+    Therefore this script assumes the LVK `sampling_pdf` density is per
+    (mass1_source, mass2_source, redshift), so the conversion to log source
+    masses contributes the Jacobian |d(m1,m2)/d(log m1,log m2)| = m1*m2.
+    If the file does not explicitly document that convention, we keep running
+    in permissive mode but mark the measure as unverified.
+    """
+    root_attrs, grp_attrs, dataset_attrs = print_lvk_hdf5_audit_attrs(f, grp)
+    all_attrs = {f"root.{k}": v for k, v in root_attrs.items()}
+    all_attrs.update({f"injections.{k}": v for k, v in grp_attrs.items()})
+    for dataset_name, attrs in dataset_attrs.items():
+        all_attrs.update({f"injections/{dataset_name}.{k}": v for k, v in attrs.items()})
+    haystack = "\n".join(f"{k}={v}" for k, v in all_attrs.items()).lower()
+
+    has_sampling_pdf_metadata = "sampling_pdf" in haystack or "sampling pdf" in haystack
+    mentions_source_masses = ("mass1_source" in haystack or "m1_source" in haystack) and (
+        "mass2_source" in haystack or "m2_source" in haystack
+    )
+    mentions_redshift = "redshift" in haystack or " z" in haystack
+    mentions_log_mass_measure = "log_mass" in haystack or "log mass" in haystack or "logm" in haystack
+
+    assumed_measure = "d(mass1_source) d(mass2_source) d(redshift)"
+    verified = bool(has_sampling_pdf_metadata and mentions_source_masses and mentions_redshift and not mentions_log_mass_measure)
+    status = "verified" if verified else "ambiguous"
+    message = (
+        f"LVK sampling_pdf measure {status}; code assumes {assumed_measure} and applies "
+        "an m1*m2 Jacobian to evaluate kernels in log source masses."
+    )
+    if not verified:
+        message += " HDF5 metadata is ambiguous; no unsupported claim is made."
+
+    return dict(
+        verified=verified,
+        status=status,
+        assumed_measure=assumed_measure,
+        message=message,
+        root_attrs=root_attrs,
+        injection_attrs=grp_attrs,
+        dataset_attrs=dataset_attrs,
+    )
+
+
+def load_lvk_injections(
+    lvk_path: str,
+    n_inj_total: int | None = None,
+    strict_sampling_pdf: bool = False,
+) -> dict:
+    """Load LVK found injection set and audit the `sampling_pdf` coordinate measure."""
+    measure_metadata = dict(
+        verified=False,
+        status="not_hdf5",
+        assumed_measure="d(mass1_source) d(mass2_source) d(redshift)",
+        message="No HDF5 metadata available for LVK sampling_pdf validation.",
+        root_attrs={},
+        injection_attrs={},
+        dataset_attrs={},
+    )
     if lvk_path.endswith('.h5') or lvk_path.endswith('.hdf5'):
         import h5py
         with h5py.File(lvk_path, 'r') as f:
             grp    = f['injections']
+            measure_metadata = validate_lvk_sampling_pdf_measure(f, grp)
+            print(f"  {measure_metadata['message']}")
+            if not measure_metadata['verified']:
+                warning_msg = "PROMINENT WARNING: " + str(measure_metadata['message'])
+                if strict_sampling_pdf:
+                    raise ValueError(warning_msg + " Re-run without --strict_lvk_sampling_pdf True to permit ambiguous metadata.")
+                warnings.warn(warning_msg, RuntimeWarning)
             m1     = grp['mass1_source'][:].astype(np.float64)
             m2     = grp['mass2_source'][:].astype(np.float64)
             z      = grp['redshift'][:].astype(np.float64)
@@ -839,6 +961,9 @@ def load_lvk_injections(lvk_path: str, n_inj_total: int | None = None) -> dict:
         z     = data['z' if 'z' in data else 'redshift'].astype(np.float64)
         q_lvk = (data['sampling_pdf'].astype(np.float64)
                  if 'sampling_pdf' in data else np.ones(len(m1)))
+        if strict_sampling_pdf:
+            raise ValueError("--strict_lvk_sampling_pdf True requires verifiable HDF5 metadata; NPZ LVK injections are unverified.")
+        warnings.warn("PROMINENT WARNING: NPZ LVK injections do not provide HDF5 sampling_pdf measure metadata; measure is unverified.", RuntimeWarning)
         N_inj = (int(n_inj_total) if n_inj_total is not None
                  else int(data['N_inj'].ravel()[0]))
 
@@ -846,7 +971,7 @@ def load_lvk_injections(lvk_path: str, n_inj_total: int | None = None) -> dict:
     swap   = m1 < m2
     m1[swap], m2[swap] = m2[swap].copy(), m1[swap].copy()
 
-    return dict(m1=m1, m2=m2, z=z, q_lvk=q_lvk, N_inj=N_inj)
+    return dict(m1=m1, m2=m2, z=z, q_lvk=q_lvk, N_inj=N_inj, sampling_pdf_metadata=measure_metadata)
 
 
 def build_kernel_matrix_chunked(
@@ -916,7 +1041,12 @@ def build_kernel_matrix_chunked(
 
     print("  K matrix complete.")
 
-    # log_v = log(1 / (q_LVK * m1 * m2))
+    # The Gaussian KDE is defined in x=(log m1_source, log m2_source, z),
+    # while verified LVK sampling_pdf metadata is expected to describe a density
+    # in y=(m1_source, m2_source, z).  Importance weights in x require
+    # q_x(x) = q_y(y) * |dy/dx| = q_LVK * m1 * m2, hence the m1*m2
+    # Jacobian in the denominator below.  If the HDF5 metadata was ambiguous,
+    # load_lvk_injections() warns (or raises in strict mode) before reaching here.
     with np.errstate(divide='ignore', invalid='ignore'):
         log_v_np = -(np.log(lvk['q_lvk']) + np.log(lvk['m1']) + np.log(lvk['m2']))
     log_v_np[~np.isfinite(log_v_np)] = -np.inf
@@ -927,6 +1057,36 @@ def build_kernel_matrix_chunked(
     # log_v is moved to JAX device for use in logsumexp.
     return K, jnp.array(log_v_np), float(log_norm)
 
+
+
+def diagnose_lvk_selection_contributions(K: np.ndarray, log_v: jnp.ndarray, label: str = "uniform COSMIC test population") -> None:
+    """Print effective found-injection contribution diagnostics for a simple test population.
+
+    The test population assigns equal probability to every COSMIC merger in the
+    KDE support.  It is not an astrophysical claim; it is a smoke test exposing
+    whether a small number of found injections dominate the Farr estimator.
+    """
+    if K.size == 0:
+        print("  LVK selection diagnostic skipped: empty K matrix.")
+        return
+    mean_kernel = np.asarray(K, dtype=np.float64).mean(axis=1)
+    log_v_np = np.asarray(log_v, dtype=np.float64)
+    with np.errstate(over='ignore', under='ignore', invalid='ignore'):
+        contrib = np.exp(log_v_np) * mean_kernel
+    finite = contrib[np.isfinite(contrib) & (contrib > 0.0)]
+    print(f"  LVK selection diagnostic ({label}):")
+    if finite.size == 0:
+        print("    no positive finite found-injection contributions")
+        return
+    total = finite.sum()
+    normed = finite / total
+    n_eff = 1.0 / np.sum(normed**2)
+    qs = np.percentile(finite, [0, 5, 50, 95, 99, 100])
+    top = np.sort(normed)[::-1]
+    print(f"    positive finite contributions: {finite.size:,}/{contrib.size:,}")
+    print(f"    effective contributors: {n_eff:.1f}")
+    print("    contribution quantiles [0,5,50,95,99,100]%: " + ", ".join(f"{q:.3e}" for q in qs))
+    print(f"    top 1 / 10 / 100 cumulative fractions: {top[:1].sum():.3f} / {top[:10].sum():.3f} / {top[:100].sum():.3f}")
 
 def discover_events(results_root: str, config_name: str) -> list[str]:
     pattern = os.path.join(results_root, '*', config_name, 'log_z.npy')
@@ -974,6 +1134,8 @@ def parse_args():
     sel.add_argument("--lvk_bandwidth_log_m1", type=float, default=None)
     sel.add_argument("--lvk_bandwidth_log_m2", type=float, default=None)
     sel.add_argument("--lvk_bandwidth_z",      type=float, default=None)
+    sel.add_argument("--strict_lvk_sampling_pdf", type=str2bool, default=False,
+                     help="Fail instead of warning when LVK HDF5 metadata does not verify that sampling_pdf is in d(mass1_source) d(mass2_source) d(redshift).")
 
     return p.parse_args()
 
@@ -1074,9 +1236,19 @@ def main():
     # ---- Selection effects ----
     log_alpha_fn = None
     cosmic_raw   = None   # made available for PPD plots below
+    lvk_sampling_pdf_metadata = dict(
+        verified=False,
+        status="not_used",
+        assumed_measure="d(mass1_source) d(mass2_source) d(redshift)",
+        message="LVK selection was not used.",
+        root_attrs={},
+        injection_attrs={},
+        dataset_attrs={},
+    )
     if selection_mode == "lvk_farr":
         print(f"\n Loading LVK found injections: {opts.lvk_found_path}")
-        lvk = load_lvk_injections(opts.lvk_found_path, opts.lvk_n_inj_total)
+        lvk = load_lvk_injections(opts.lvk_found_path, opts.lvk_n_inj_total, opts.strict_lvk_sampling_pdf)
+        lvk_sampling_pdf_metadata = lvk['sampling_pdf_metadata']
         print(f"  N_found={len(lvk['m1']):,}  N_inj={lvk['N_inj']:,}")
 
         # Subsample found injections for speed.
@@ -1153,6 +1325,7 @@ def main():
             }
 
         K_np, log_v, log_norm = build_kernel_matrix_chunked(lvk, cosmic, bandwidth)
+        diagnose_lvk_selection_contributions(K_np, log_v)
         print(f"  log_norm = {log_norm:.3f}")
         print(f"  K matmul: numpy pure_callback (K stays in system RAM).")
 
@@ -1722,6 +1895,14 @@ def main():
         n_events         = n_events,
         wall_time_s      = elapsed_total,
         jax_backend      = jax.default_backend(),
+        strict_lvk_sampling_pdf = opts.strict_lvk_sampling_pdf,
+        lvk_sampling_pdf_verified = bool(lvk_sampling_pdf_metadata.get('verified', False)),
+        lvk_sampling_pdf_status = str(lvk_sampling_pdf_metadata.get('status', 'unknown')),
+        lvk_sampling_pdf_assumed_measure = str(lvk_sampling_pdf_metadata.get('assumed_measure', 'unknown')),
+        lvk_sampling_pdf_validation_message = str(lvk_sampling_pdf_metadata.get('message', '')),
+        lvk_sampling_pdf_root_attrs = np.array(lvk_sampling_pdf_metadata.get('root_attrs', {}), dtype=object),
+        lvk_sampling_pdf_injection_attrs = np.array(lvk_sampling_pdf_metadata.get('injection_attrs', {}), dtype=object),
+        lvk_sampling_pdf_dataset_attrs = np.array(lvk_sampling_pdf_metadata.get('dataset_attrs', {}), dtype=object),
     )
 
     print(f"\n Total wall time: {elapsed_total/60:.1f} min")
