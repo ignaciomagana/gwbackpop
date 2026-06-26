@@ -19,4 +19,4 @@ jobs:
       - name: Smoke-test non-COSMIC imports
         run: python smoke_test_imports.py --skip-cosmic
       - name: Run lightweight tests
-        run: pytest tests/test_lightweight_infrastructure.py tests/test_truncated_population_densities.py tests/test_hierarchical_toy_recovery.py tests/test_selection_model_consistency.py tests/test_default_hyperparams.py
+        run: pytest tests/test_lightweight_infrastructure.py tests/test_truncated_population_densities.py tests/test_hierarchical_toy_recovery.py tests/test_selection_model_consistency.py tests/test_default_hyperparams.py tests/test_injection_proposal.py

@@ -128,3 +128,82 @@ def test_3d_logz_proposal_and_static_numerator_use_same_config_support():
         )
     finally:
         ri.LIKELIHOOD_MODE, ri.LOGZ_LO, ri.LOGZ_HI = old_mode, old_lo, old_hi
+
+
+def test_likelihood_3d_accepts_config_logz_support(monkeypatch):
+    import importlib
+    import sys
+    import types
+
+    class FakeKDE:
+        def logpdf(self, coord):
+            return np.array([0.0])
+
+    fake_nautilus = types.ModuleType("nautilus")
+    fake_nautilus.Prior = object
+    fake_nautilus.Sampler = object
+    monkeypatch.setitem(sys.modules, "nautilus", fake_nautilus)
+
+    fake_backpop = types.ModuleType("backpop")
+    fake_backpop.get_backpop_config = lambda name: None
+    fake_backpop.load_gw_data = lambda *args, **kwargs: None
+    fake_backpop.evolv2 = lambda *args, **kwargs: None
+    fake_backpop.str_to_bool = lambda value: value
+    fake_backpop.BPP_SHAPE = (1,)
+    fake_backpop.KICK_SHAPE = (1,)
+    fake_backpop.COLS_KEEP = []
+    monkeypatch.setitem(sys.modules, "backpop", fake_backpop)
+
+    sys.modules.pop("run_backpop", None)
+    run_backpop = importlib.import_module("run_backpop")
+
+    monkeypatch.setattr(
+        run_backpop,
+        "evolv2",
+        lambda params, output_columns, fixed_params: (
+            {"mass_1": 30.0, "mass_2": 20.0},
+            np.array([1.0]),
+            np.array([2.0]),
+        ),
+    )
+    monkeypatch.setattr(run_backpop, "_extract_t_delay_myr", lambda bpp_raw: 100.0)
+    monkeypatch.setattr(run_backpop, "z_merger_from_t_delay", lambda z_form, t_delay: 0.1)
+
+    log_prob, bpp_flat, kick_flat = run_backpop.likelihood_3d(
+        {"z_form": 1.0, "logZ": -2.0},
+        kde=FakeKDE(),
+        q_bounds=(0.0, 1.0),
+        mc_bounds=(0.0, 100.0),
+        z_bounds=(0.0, 2.0),
+        support_gate="none",
+        fixed_params={},
+        logZ_support=(-4.0, 0.0),
+    )
+
+    assert np.isfinite(log_prob)
+    assert np.array_equal(bpp_flat, np.array([1.0]))
+    assert np.array_equal(kick_flat, np.array([2.0]))
+
+    log_prob, _, _ = run_backpop.likelihood_3d(
+        {"z_form": 1.0, "logZ": -5.0},
+        kde=FakeKDE(),
+        q_bounds=(0.0, 1.0),
+        mc_bounds=(0.0, 100.0),
+        z_bounds=(0.0, 2.0),
+        support_gate="none",
+        fixed_params={},
+        logZ_support=(-4.0, 0.0),
+    )
+    assert np.isneginf(log_prob)
+
+    with pytest.raises(ValueError, match="logZ_support must satisfy lo < hi"):
+        run_backpop.likelihood_3d(
+            {"z_form": 1.0, "logZ": -2.0},
+            kde=FakeKDE(),
+            q_bounds=(0.0, 1.0),
+            mc_bounds=(0.0, 100.0),
+            z_bounds=(0.0, 2.0),
+            support_gate="none",
+            fixed_params={},
+            logZ_support=(0.0, -4.0),
+        )
