@@ -80,13 +80,6 @@ DEFAULT_CONFIG_NAME = "lucky_strikes"
 def _load_config(config_name: str):
     from backpop import get_backpop_config
 
-    if config_name.endswith("_zform"):
-        raise NotImplementedError(
-            f"Injection campaigns for config_name={config_name!r} are not implemented. "
-            "Those configs sample z_form in the event likelihood; the injection "
-            "proposal must be updated to record the same physical z_form proposal "
-            "before they can be used consistently."
-        )
     lower_bound, upper_bound, params_in, fixed_params = get_backpop_config(config_name)
     return (
         np.asarray(lower_bound, dtype=np.float64),
@@ -106,7 +99,8 @@ LOWER, UPPER, PARAMS, FIXED_PARAMS = _load_config(DEFAULT_CONFIG_NAME)
 # Choice: σ=50 km/s gives median kick ~63 km/s.  BH kicks from fallback
 # are typically O(10-100) km/s for massive progenitors (Fryer+2012, Mandel+2016).
 KICK_PROPOSAL_SIGMA: float = 50.0   # km/s  — Maxwellian scale parameter
-PROPOSAL_NAME = "zams_uniform_truncated_maxwell_sfr_logz"
+PROPOSAL_NAME = "zams_uniform_truncated_maxwell_aux_zform"
+LIKELIHOOD_MODE = "2D"
 PROPOSAL_VERSION = "2"
 COORDINATE_SYSTEM = "backpop_zams_log10Z_zform_source_merger"
 
@@ -122,13 +116,14 @@ ZFORM_MAX = 20.0
 # Worker function (runs in subprocess — must be importable at module level)
 # ---------------------------------------------------------------------------
 
-def _worker_init(pdet_path: str | None, config_name: str = DEFAULT_CONFIG_NAME) -> None:
+def _worker_init(pdet_path: str | None, config_name: str = DEFAULT_CONFIG_NAME, likelihood_mode: str = "2D") -> None:
     """Load P_det interpolator once per worker process.
     If pdet_path is None, P_det evaluation is skipped and pdet=nan is stored.
     Use this mode when building the COSMIC merger catalog for LVKInjectionCampaign.
     """
-    global _PDET, LOWER, UPPER, PARAMS, FIXED_PARAMS
+    global _PDET, LOWER, UPPER, PARAMS, FIXED_PARAMS, LIKELIHOOD_MODE
     LOWER, UPPER, PARAMS, FIXED_PARAMS = _load_config(config_name)
+    LIKELIHOOD_MODE = str(likelihood_mode).upper()
     if pdet_path is None:
         _PDET = None
         return
@@ -165,25 +160,28 @@ def _run_one(seed: int) -> dict | None:
             # Reflect truncation into theta for storage.
             theta[i_kick] = params_dict[kick_name]
 
-    # ---- Draw z_form from SFR prior via inverse CDF (rejection sampling) ----
-    # Import here so the worker subprocess gets its own copy
-    from cosmo_prior import log_prior_z_form, log_prior_logZ_given_z
-
+    # ---- Draw auxiliary formation redshift and metallicity ----
+    # 2D selection uses z_form only as a COSMIC/redshift auxiliary variable and
+    # draws logZ from the same flat base measure as the 2D event likelihood.
+    # 3D selection uses the physical SFR and P(logZ | z_form) priors.
     z_form = _draw_z_form(rng)
     if z_form is None:
         return None
 
-    # ---- Draw logZ from P(logZ | z_form) via rejection sampling ----
-    log10_Z = _draw_logZ_given_z(rng, z_form)
-    if log10_Z is None:
-        return None
+    if LIKELIHOOD_MODE == "2D":
+        log10_Z = float(rng.uniform(LOGZ_LO, LOGZ_HI))
+    elif LIKELIHOOD_MODE == "3D":
+        log10_Z = _draw_logZ_given_z(rng, z_form)
+        if log10_Z is None:
+            return None
+    else:
+        raise ValueError(f"Unknown LIKELIHOOD_MODE={LIKELIHOOD_MODE!r}")
 
     params_dict['logZ'] = log10_Z
     if 'logZ' in PARAMS:
         theta[PARAMS.index('logZ')] = log10_Z
     if 'z_form' in PARAMS:
-        # Guard against future direct worker calls if _load_config was bypassed.
-        raise NotImplementedError("z_form injection parameters are not implemented")
+        theta[PARAMS.index('z_form')] = z_form
 
     log_q_proposal = compute_log_q_proposal(theta, z_form, log10_Z, KICK_PROPOSAL_SIGMA)
     if not np.isfinite(log_q_proposal):
@@ -303,15 +301,17 @@ def compute_log_q_proposal(
             return -np.inf
         if name in ("vk1", "vk2"):
             log_q += float(_truncated_maxwell_logpdf(theta[i], kick_sigma, LOWER[i], UPPER[i]))
-        elif name == "logZ":
-            # logZ is proposed from P(logZ | z_form), not uniformly.
+        elif name == "logZ" and LIKELIHOOD_MODE == "3D":
+            # 3D logZ is proposed from P(logZ | z_form), not uniformly.
             continue
-        elif name == "z_form":
-            raise NotImplementedError("z_form injection proposal is not implemented")
+        elif name == "z_form" and LIKELIHOOD_MODE == "3D":
+            # 3D z_form is proposed from the SFR prior below, not uniformly.
+            continue
         else:
             log_q += float(-np.log(UPPER[i] - LOWER[i]))
     log_q += float(_log_q_z_form(z_form))
-    log_q += float(log_prior_logZ_given_z(log10_Z, z_form))
+    if LIKELIHOOD_MODE == "3D":
+        log_q += float(log_prior_logZ_given_z(log10_Z, z_form))
     return float(log_q)
 
 
@@ -363,6 +363,7 @@ def run_campaign(
     n_workers: int,
     chunk_size: int = 500,
     config_name: str | None = None,
+    likelihood_mode: str = "2D",
 ) -> None:
     """Run the full injection campaign and save results.
 
@@ -380,8 +381,11 @@ def run_campaign(
         Seeds per Pool.map call — balances overhead vs memory.
     """
     config_name = config_name or DEFAULT_CONFIG_NAME
-    global LOWER, UPPER, PARAMS, FIXED_PARAMS
+    global LOWER, UPPER, PARAMS, FIXED_PARAMS, LIKELIHOOD_MODE
     LOWER, UPPER, PARAMS, FIXED_PARAMS = _load_config(config_name)
+    LIKELIHOOD_MODE = str(likelihood_mode).upper()
+    if LIKELIHOOD_MODE not in {"2D", "3D"}:
+        raise ValueError("likelihood_mode must be 2D or 3D")
 
     os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
     start = time.time()
@@ -400,7 +404,7 @@ def run_campaign(
     with Pool(
         processes=n_workers,
         initializer=_worker_init,
-        initargs=(pdet_path, config_name),
+        initargs=(pdet_path, config_name, LIKELIHOOD_MODE),
     ) as pool:
         for i in range(0, n_inj, chunk_size):
             batch = seeds[i : i + chunk_size]
@@ -481,6 +485,10 @@ def run_campaign(
         proposal_version      = np.array([PROPOSAL_VERSION]),
         coordinate_system     = np.array([COORDINATE_SYSTEM]),
         config_name           = np.array([config_name]),
+        likelihood_mode        = np.array([LIKELIHOOD_MODE]),
+        uses_z_form           = np.array([LIKELIHOOD_MODE == "3D"]),
+        uses_sfr_prior        = np.array([LIKELIHOOD_MODE == "3D"]),
+        uses_logZ_given_z_prior = np.array([LIKELIHOOD_MODE == "3D"]),
         wall_time_s          = np.array([elapsed]),
     )
     print(f"  Saved: {output_path}")
@@ -509,6 +517,8 @@ def parse_args():
                    help="If True, run n_inj=10000 to estimate merger fraction only.")
     p.add_argument("--config_name", default=DEFAULT_CONFIG_NAME,
                    help="BackPop config name whose params/bounds are used for injections (default: lucky_strikes).")
+    p.add_argument("--likelihood_mode", choices=["2D", "3D"], default="2D",
+                   help="Selection base measure metadata/proposal: 2D uses flat logZ and no population z_form; 3D uses SFR z_form and P(logZ|z_form).")
     return p.parse_args()
 
 
@@ -528,6 +538,7 @@ def main():
         n_workers   = nw,
         chunk_size  = opts.chunk_size,
         config_name  = opts.config_name,
+        likelihood_mode = opts.likelihood_mode,
     )
 
 

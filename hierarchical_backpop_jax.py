@@ -772,6 +772,55 @@ def make_numpyro_model(log_likelihood_fn: callable) -> callable:
     return model
 
 
+
+def _npz_scalar(npz, key, default=None):
+    if key not in npz:
+        return default
+    value = npz[key]
+    if hasattr(value, "shape") and value.shape == ():
+        value = value.item()
+    elif hasattr(value, "ravel"):
+        value = value.ravel()[0]
+    if isinstance(value, bytes):
+        return value.decode()
+    return value
+
+def _bool_meta(value, default=False):
+    if value is None:
+        return default
+    if isinstance(value, bool) or type(value).__name__ == "bool_":
+        return bool(value)
+    return str(value).strip().lower() in {"true", "t", "1", "yes", "y", "on"}
+
+def metadata_model_signature(meta: dict) -> dict:
+    mode = str(meta.get("likelihood_mode", "3D" if meta.get("uses_z_form") else "2D")).upper()
+    return {
+        "likelihood_mode": mode,
+        "uses_z_form": _bool_meta(meta.get("uses_z_form"), mode == "3D"),
+        "uses_sfr_prior": _bool_meta(meta.get("uses_sfr_prior"), mode == "3D"),
+        "uses_logZ_given_z_prior": _bool_meta(meta.get("uses_logZ_given_z_prior"), mode == "3D"),
+    }
+
+def validate_selection_model_consistency(event_meta: list[dict], injection_meta: dict | None, allow_inconsistent: bool = False) -> tuple[bool, str]:
+    if not event_meta or injection_meta is None:
+        return True, "No selection injection metadata to compare."
+    event_sigs = [metadata_model_signature(m) for m in event_meta]
+    first = event_sigs[0]
+    if any(sig != first for sig in event_sigs[1:]):
+        msg = f"Single-event posterior metadata are mixed: {event_sigs}"
+        if allow_inconsistent:
+            return False, msg
+        raise ValueError(msg + "; pass --allow_inconsistent_selection_model True to override.")
+    inj_sig = metadata_model_signature(injection_meta)
+    if first != inj_sig:
+        msg = ("Event posterior and selection injection generative models are inconsistent: "
+               f"event={first}, injections={inj_sig}")
+        if allow_inconsistent:
+            warnings.warn(msg, RuntimeWarning)
+            return False, msg
+        raise ValueError(msg + "; pass --allow_inconsistent_selection_model True to override.")
+    return True, "Event posterior and selection injection metadata match."
+
 # ---------------------------------------------------------------------------
 # Data loading (reuses logic from hierarchical_backpop.py)
 # ---------------------------------------------------------------------------
@@ -779,7 +828,7 @@ def make_numpyro_model(log_likelihood_fn: callable) -> callable:
 def load_event_data(
     results_dir: str,
     n_samples:   int = 10_000,
-) -> tuple[jnp.ndarray, dict[str, int], jnp.ndarray, jnp.ndarray, float, str]:
+) -> tuple[jnp.ndarray, dict[str, int], jnp.ndarray, jnp.ndarray, float, str, dict]:
     """Load a single-event BackPop posterior and return JAX arrays.
 
     Returns
@@ -807,7 +856,13 @@ def load_event_data(
     samples = points[idx].astype(np.float64)
 
     n_eff = int(1.0 / np.sum(weights**2))
-    print(f"  {name}: N_eff={n_eff}  log Z={log_z:.2f}  params={len(params)}-D")
+    event_meta = {
+        "likelihood_mode": _npz_scalar(meta, "likelihood_mode", "2D"),
+        "uses_z_form": _npz_scalar(meta, "uses_z_form", _npz_scalar(meta, "use_redshift_likelihood", False)),
+        "uses_sfr_prior": _npz_scalar(meta, "uses_sfr_prior", _npz_scalar(meta, "use_redshift_likelihood", False)),
+        "uses_logZ_given_z_prior": _npz_scalar(meta, "uses_logZ_given_z_prior", _npz_scalar(meta, "use_redshift_likelihood", False)),
+    }
+    print(f"  {name}: N_eff={n_eff}  log Z={log_z:.2f}  params={len(params)}-D  mode={metadata_model_signature(event_meta)}")
 
     return (
         jnp.array(samples),
@@ -816,6 +871,7 @@ def load_event_data(
         jnp.array(hi),
         log_z,
         name,
+        event_meta,
     )
 
 
@@ -1138,6 +1194,8 @@ def parse_args():
     sel.add_argument("--lvk_bandwidth_z",      type=float, default=None)
     sel.add_argument("--strict_lvk_sampling_pdf", type=str2bool, default=False,
                      help="Fail instead of warning when LVK HDF5 metadata does not verify that sampling_pdf is in d(mass1_source) d(mass2_source) d(redshift).")
+    sel.add_argument("--allow_inconsistent_selection_model", type=str2bool, default=False,
+                     help="Explicitly allow event posterior and injection metadata to use different base measures. Intended only for legacy diagnostics.")
 
     return p.parse_args()
 
@@ -1226,16 +1284,17 @@ def main():
         event_dirs = discover_events(opts.results_root, opts.config_name)
 
     print(f"\n Loading {len(event_dirs)} events...")
-    all_samples, all_pidx, all_lo, all_hi, all_logz, event_names = [], [], [], [], [], []
+    all_samples, all_pidx, all_lo, all_hi, all_logz, event_names, event_model_metadata = [], [], [], [], [], [], []
     for d in event_dirs:
         try:
-            samp, pidx, lo, hi, lz, name = load_event_data(d, opts.n_samples)
+            samp, pidx, lo, hi, lz, name, ev_meta = load_event_data(d, opts.n_samples)
             all_samples.append(samp)
             all_pidx.append(pidx)
             all_lo.append(lo)
             all_hi.append(hi)
             all_logz.append(lz)
             event_names.append(name)
+            event_model_metadata.append(ev_meta)
         except Exception as e:
             print(f"  WARNING: skipping {d} — {e}")
 
@@ -1259,6 +1318,9 @@ def main():
     N_found_total = 0
     N_found_used = 0
     lvk_found_subsample_log_scale = 0.0
+    selection_model_consistent = True
+    selection_model_consistency_message = "Selection disabled; no injection metadata compared."
+    injection_model_metadata = {}
     lvk_sampling_pdf_metadata = dict(
         verified=False,
         status="not_used",
@@ -1295,6 +1357,16 @@ def main():
 
         print(f"\n Loading COSMIC merger catalog: {opts.injections_path}")
         cosmic_raw = np.load(opts.injections_path, allow_pickle=True)
+        injection_model_metadata = {
+            "likelihood_mode": _npz_scalar(cosmic_raw, "likelihood_mode", "3D" if "z_form" in cosmic_raw else "2D"),
+            "uses_z_form": _npz_scalar(cosmic_raw, "uses_z_form", "z_form" in cosmic_raw),
+            "uses_sfr_prior": _npz_scalar(cosmic_raw, "uses_sfr_prior", "z_form" in cosmic_raw),
+            "uses_logZ_given_z_prior": _npz_scalar(cosmic_raw, "uses_logZ_given_z_prior", "z_form" in cosmic_raw and "logZ" in cosmic_raw),
+        }
+        selection_model_consistent, selection_model_consistency_message = validate_selection_model_consistency(
+            event_model_metadata, injection_model_metadata, opts.allow_inconsistent_selection_model
+        )
+        print(f"  Selection model consistency: {selection_model_consistency_message}")
         log_q_arr = None
         log_pop_static_arr = None
         if 'log_q_proposal' in cosmic_raw:
@@ -1312,11 +1384,14 @@ def main():
                 if name not in ('alpha_1', 'alpha_2', 'flim_1', 'flim_2', 'vk1', 'vk2'):
                     idx = pidx_tmp[name]
                     log_pop_static_arr += -np.log(hi_tmp[idx] - lo_tmp[idx])
-            if 'z_form' in cosmic_raw and 'logZ' in cosmic_raw:
+            inj_sig_for_weights = metadata_model_signature(injection_model_metadata)
+            if (inj_sig_for_weights['uses_z_form'] or inj_sig_for_weights['uses_sfr_prior'] or inj_sig_for_weights['uses_logZ_given_z_prior']) and 'z_form' in cosmic_raw and 'logZ' in cosmic_raw:
                 zf = cosmic_raw['z_form'].astype(np.float64)
                 lz = cosmic_raw['logZ'].astype(np.float64)
-                log_pop_static_arr += np.array([log_prior_z_form(z) for z in zf])
-                log_pop_static_arr += np.array([log_prior_logZ_given_z(zmet, z) for zmet, z in zip(lz, zf)])
+                if inj_sig_for_weights['uses_sfr_prior']:
+                    log_pop_static_arr += np.array([log_prior_z_form(z) for z in zf])
+                if inj_sig_for_weights['uses_logZ_given_z_prior']:
+                    log_pop_static_arr += np.array([log_prior_logZ_given_z(zmet, z) for zmet, z in zip(lz, zf)])
             else:
                 warnings.warn(
                     "Injection file has log_q_proposal but lacks z_form/logZ; "
@@ -1942,6 +2017,11 @@ def main():
         lvk_N_found_total = N_found_total,
         lvk_N_found_used = N_found_used,
         lvk_found_subsample_log_scaling = lvk_found_subsample_log_scale,
+        allow_inconsistent_selection_model = opts.allow_inconsistent_selection_model,
+        selection_model_consistent = selection_model_consistent if selection_mode == "lvk_farr" else True,
+        selection_model_consistency_message = selection_model_consistency_message if selection_mode == "lvk_farr" else "Selection disabled; no injection metadata compared.",
+        event_model_metadata = np.array(event_model_metadata, dtype=object),
+        injection_model_metadata = np.array(injection_model_metadata if selection_mode == "lvk_farr" else {}, dtype=object),
     )
 
     print(f"\n Total wall time: {elapsed_total/60:.1f} min")
