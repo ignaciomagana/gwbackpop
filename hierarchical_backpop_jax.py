@@ -108,6 +108,8 @@ import numpyro.distributions as dist
 from numpyro.infer import NUTS, MCMC
 from numpyro.diagnostics import print_summary, effective_sample_size, gelman_rubin
 
+from metadata_utils import base_runtime_metadata, get_package_versions, save_metadata
+
 
 def str2bool(value):
     """Parse CLI booleans such as True/False, yes/no, and 1/0."""
@@ -1385,12 +1387,17 @@ def main():
 
         print(f"\n Loading COSMIC merger catalog: {opts.injections_path}")
         cosmic_raw = np.load(opts.injections_path, allow_pickle=True)
-        injection_model_metadata = {
-            "likelihood_mode": _npz_scalar(cosmic_raw, "likelihood_mode", "3D" if "z_form" in cosmic_raw else "2D"),
-            "uses_z_form": _npz_scalar(cosmic_raw, "uses_z_form", "z_form" in cosmic_raw),
-            "uses_sfr_prior": _npz_scalar(cosmic_raw, "uses_sfr_prior", "z_form" in cosmic_raw),
-            "uses_logZ_given_z_prior": _npz_scalar(cosmic_raw, "uses_logZ_given_z_prior", "z_form" in cosmic_raw and "logZ" in cosmic_raw),
-        }
+        if "metadata" in cosmic_raw:
+            injection_model_metadata = dict(cosmic_raw["metadata"].item())
+        else:
+            injection_model_metadata = {}
+        injection_model_metadata.update({
+            "likelihood_mode": _npz_scalar(cosmic_raw, "likelihood_mode", injection_model_metadata.get("likelihood_mode", "3D" if "z_form" in cosmic_raw else "2D")),
+            "uses_z_form": _npz_scalar(cosmic_raw, "uses_z_form", injection_model_metadata.get("uses_z_form", "z_form" in cosmic_raw)),
+            "uses_sfr_prior": _npz_scalar(cosmic_raw, "uses_sfr_prior", injection_model_metadata.get("uses_sfr_prior", "z_form" in cosmic_raw)),
+            "uses_logZ_given_z_prior": _npz_scalar(cosmic_raw, "uses_logZ_given_z_prior", injection_model_metadata.get("uses_logZ_given_z_prior", "z_form" in cosmic_raw and "logZ" in cosmic_raw)),
+            "proposal_version": _npz_scalar(cosmic_raw, "proposal_version", injection_model_metadata.get("proposal_version", "unknown")),
+        })
         selection_model_consistent, selection_model_consistency_message = validate_selection_model_consistency(
             event_model_metadata, injection_model_metadata, opts.allow_inconsistent_selection_model
         )
@@ -2019,8 +2026,10 @@ def main():
 
     # ---- Metadata ----
     elapsed_total = time.time() - start_time
-    np.savez(
-        os.path.join(out_dir, "metadata.npz"),
+    jax_devices = [str(device) for device in jax.devices()]
+    metadata = dict(
+        **base_runtime_metadata("."),
+        package_versions=get_package_versions(["numpy", "scipy", "jax", "jaxlib", "numpyro"]),
         event_names      = event_names,
         config_name      = opts.config_name,
         pop_param_names  = POP_PARAM_NAMES,
@@ -2051,8 +2060,29 @@ def main():
         selection_model_consistent = selection_model_consistent if selection_mode == "lvk_farr" else True,
         selection_model_consistency_message = selection_model_consistency_message if selection_mode == "lvk_farr" else "Selection disabled; no injection metadata compared.",
         event_model_metadata = np.array(event_model_metadata, dtype=object),
-        injection_model_metadata = np.array(injection_model_metadata if selection_mode == "lvk_farr" else {}, dtype=object),
+        injection_model_metadata = injection_model_metadata if selection_mode == "lvk_farr" else {},
+        injection_proposal_version = injection_model_metadata.get("proposal_version", "unknown") if selection_mode == "lvk_farr" else "not_used",
+        selection_consistency_checks = dict(
+            allow_inconsistent_selection_model=bool(opts.allow_inconsistent_selection_model),
+            selection_model_consistent=bool(selection_model_consistent if selection_mode == "lvk_farr" else True),
+            message=selection_model_consistency_message if selection_mode == "lvk_farr" else "Selection disabled; no injection metadata compared.",
+        ),
+        lvk_sampling_pdf_validation_status = dict(
+            verified=bool(lvk_sampling_pdf_metadata.get('verified', False)),
+            status=str(lvk_sampling_pdf_metadata.get('status', 'unknown')),
+            assumed_measure=str(lvk_sampling_pdf_metadata.get('assumed_measure', 'unknown')),
+            message=str(lvk_sampling_pdf_metadata.get('message', '')),
+        ),
+        found_injection_subsampling_counts = dict(
+            N_found_total=int(N_found_total),
+            N_found_used=int(N_found_used),
+            log_scaling=float(lvk_found_subsample_log_scale),
+        ),
+        jax_x64_enabled=bool(jax.config.jax_enable_x64),
+        jax_devices=jax_devices,
+        jax_default_device=str(jax.devices()[0]) if jax.devices() else "none",
     )
+    save_metadata(out_dir, metadata)
     with open(os.path.join(out_dir, "hyperpriors.json"), "w", encoding="utf-8") as f:
         json.dump({
             "hyperparameter_names": POP_PARAM_NAMES,
