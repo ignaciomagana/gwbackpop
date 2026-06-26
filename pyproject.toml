@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gwbackpop"
+version = "0.1.0"
+description = "BackPop gravitational-wave binary-population inference workflows"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy",
+  "scipy",
+  "pandas",
+  "astropy",
+  "pesummary",
+  "nautilus-sampler",
+  "jax",
+  "numpyro",
+  "h5py",
+  "matplotlib",
+  "corner",
+  "arviz",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+cosmic = ["cosmic-popsynth"]
+all = ["pytest", "cosmic-popsynth"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+  "cosmic: tests that import or run COSMIC binary-evolution code",
+]
+
+[tool.setuptools]
+py-modules = [
+  "backpop",
+  "backpop_config",
+  "cosmo_prior",
+  "hierarchical_backpop_jax",
+  "metadata_utils",
+  "plot_backpop",
+  "run_backpop",
+  "run_injections",
+]

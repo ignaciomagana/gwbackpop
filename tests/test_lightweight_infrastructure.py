@@ -1,0 +1,65 @@
+import json
+import math
+
+import numpy as np
+import pytest
+
+from backpop_config import get_backpop_config
+from metadata_utils import load_metadata_prefer_json, save_metadata
+
+hb = pytest.importorskip("hierarchical_backpop_jax")
+
+
+def test_get_backpop_config_lucky_strikes_shape_and_bounds():
+    lo, hi, params, fixed = get_backpop_config("lucky_strikes")
+
+    assert len(params) == 16
+    assert lo.shape == hi.shape == (len(params),)
+    assert fixed == {}
+    assert params[:4] == ["m1", "q", "logtb", "logZ"]
+    assert np.all(hi > lo)
+    assert lo[params.index("m1")] == pytest.approx(2.0)
+    assert hi[params.index("m1")] == pytest.approx(150.0)
+
+
+def test_get_backpop_config_zform_adds_only_z_form_dimension():
+    lo, hi, params, fixed = get_backpop_config("bbh_no_kicks_zform")
+
+    assert params == ["m1", "q", "logtb", "logZ", "z_form", "alpha_1", "alpha_2", "flim_1", "flim_2"]
+    assert fixed["vk1"] == 0.0 and fixed["vk2"] == 0.0
+    assert lo[params.index("z_form")] == pytest.approx(1e-4)
+    assert hi[params.index("z_form")] == pytest.approx(20.0)
+
+
+def test_get_backpop_config_rejects_unknown_config():
+    with pytest.raises(ValueError, match="Unknown config"):
+        get_backpop_config("not_a_config")
+
+
+def test_metadata_writes_npz_and_json_round_trip(tmp_path):
+    save_metadata(tmp_path, {"array": np.array([1, 2]), "nan": np.float64(np.nan), "flag": np.bool_(True)})
+
+    assert (tmp_path / "metadata.npz").exists()
+    assert (tmp_path / "metadata.json").exists()
+    loaded = load_metadata_prefer_json(tmp_path)
+    assert loaded["array"] == [1, 2]
+    assert loaded["nan"] is None
+    assert loaded["flag"] is True
+
+    raw = json.loads((tmp_path / "metadata.json").read_text())
+    assert raw["array"] == [1, 2]
+
+
+def test_toy_hierarchical_likelihood_prefers_matching_population():
+    samples = hb.jnp.array([[1.0, 0.5], [1.2, 0.5], [1.1, 0.6], [0.9, 0.4]], dtype=hb.jnp.float64)
+    pidx = {"alpha_1": 0, "flim_1": 1}
+    lo = hb.jnp.array([0.1, 0.0], dtype=hb.jnp.float64)
+    hi = hb.jnp.array([20.0, 1.0], dtype=hb.jnp.float64)
+    log_wr_fn = hb.make_log_weight_ratio_fn(samples, pidx, lo, hi)
+    ll = hb.make_hierarchical_log_likelihood(
+        [log_wr_fn], hb.jnp.array([0.0], dtype=hb.jnp.float64), samples.shape[0], None, 1
+    )
+
+    good = hb.jnp.array([math.log(1.0), 0.25, 0.5, 10.0, math.log(120.0)], dtype=hb.jnp.float64)
+    bad = hb.jnp.array([math.log(5.0), 0.25, 4.0, 10.0, math.log(120.0)], dtype=hb.jnp.float64)
+    assert float(ll(good)) > float(ll(bad))

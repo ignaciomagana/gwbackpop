@@ -353,3 +353,39 @@ BackPop uses finite prior bounds for several event and injection parameters and 
 ### Diagnostic modes are not science results
 
 No-selection hierarchical runs, direct-`pdet` hierarchical attempts in the current JAX driver, small injection campaigns, heavily subsampled LVK found-injection matrices, and intentionally inconsistent 2D/3D combinations are diagnostics. They can be valuable for debugging but should not be presented as final astrophysical population constraints.
+
+## Environment setup and lightweight tests
+
+This repository includes a `pyproject.toml` for reproducible Python dependency setup.  A typical fresh checkout can be prepared with:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e '.[test]'
+```
+
+The core Python dependencies are `numpy`, `scipy`, `pandas`, `astropy`, `pesummary`, `nautilus-sampler`, `jax`, `numpyro`, `h5py`, `matplotlib`, `corner`, and `arviz`.
+
+COSMIC is separated from the default install because it can require compiled binary-evolution components and platform-specific setup.  If your platform supports the PyPI package, try:
+
+```bash
+python -m pip install -e '.[cosmic]'
+```
+
+If that does not work, follow the COSMIC installation instructions for your system and then rerun the smoke test without `--skip-cosmic`.
+
+Fast local checks that do not require COSMIC are:
+
+```bash
+python smoke_test_imports.py --skip-cosmic
+pytest tests/test_lightweight_infrastructure.py tests/test_truncated_population_densities.py tests/test_hierarchical_toy_recovery.py tests/test_selection_model_consistency.py tests/test_default_hyperparams.py
+```
+
+After installing COSMIC, run the full smoke import check with:
+
+```bash
+python smoke_test_imports.py
+```
+
+Heavy tests and production workflows that evolve COSMIC binaries or consume GW/LVK data products are intentionally kept separate from the GitHub Actions lightweight test job.
