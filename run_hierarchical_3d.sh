@@ -3,6 +3,7 @@
 # run_hierarchical_3d.sh
 #
 # Hierarchical BackPop population inference — 3D likelihood mode.
+# RECOMMENDED PRODUCTION SCRIPT for selection-corrected hierarchical inference.
 # Uses lucky_strikes_zform posteriors (KDE over mc, q, z_merger +
 # Andrews+2021 cosmological priors on z_form and logZ).
 # Sampler: NumPyro NUTS (HMC), implemented in hierarchical_backpop_jax.py.
@@ -13,7 +14,7 @@
 #   3. COSMIC merger catalog re-run with fixed cosmo_prior.py:
 #      injections/gwtc3_cosmic_mergers.npz  (old pre-fix NPZ is invalid)
 #   4. LVK found injection file available.
-#   5. run_hierarchical_2d.sh completed — 3D result is compared against 2D.
+#   5. Optional: run_hierarchical_2d.sh completed for a diagnostic comparison.
 #
 # Output: results/hierarchical/lucky_strikes_zform/nuts/lvk_farr/
 #   (same structure as 2D output — see run_hierarchical_2d.sh)
@@ -31,6 +32,7 @@
 #   NUM_CHAINS=4          independent chains (need >= 2 for R-hat)
 #   N_SAMPLES=10000       per-event importance sampling draws
 #   LVK_N_FOUND_MAX=5000  LVK injections for K matrix
+#   ALLOW_INCONSISTENT_SELECTION_MODEL=False  set True only for intentional legacy diagnostics
 # =============================================================================
 
 set -euo pipefail
@@ -54,6 +56,7 @@ NUM_SAMPLES="${NUM_SAMPLES:-1000}"
 NUM_CHAINS="${NUM_CHAINS:-4}"
 N_SAMPLES="${N_SAMPLES:-10000}"
 LVK_N_FOUND_MAX="${LVK_N_FOUND_MAX:-5000}"
+ALLOW_INCONSISTENT_SELECTION_MODEL="${ALLOW_INCONSISTENT_SELECTION_MODEL:-False}"  # explicit legacy/diagnostic override
 
 OUTPUT_DIR="${RESULTS_ROOT}/hierarchical/${CONFIG_NAME}/nuts/lvk_farr"
 DIR_2D="${RESULTS_ROOT}/hierarchical/lucky_strikes/nuts/lvk_farr"
@@ -104,6 +107,87 @@ for f in "${INJECTIONS_PATH}" "${LVK_FOUND_PATH}"; do
     fi
 done
 
+# Validate mode metadata and required fields before launching an expensive run.
+echo ""
+echo ">>> Checking event/injection metadata consistency..."
+python - "${RESULTS_ROOT}" "${CONFIG_NAME}" "${INJECTIONS_PATH}" "${LVK_FOUND_PATH}" "${ALLOW_INCONSISTENT_SELECTION_MODEL}" "3D" <<'PY'
+import glob
+import os
+import sys
+import numpy as np
+
+results_root, config_name, injections_path, lvk_found_path, allow_raw, expected_mode = sys.argv[1:7]
+allow = str(allow_raw).strip().lower() in {"1", "true", "yes", "y"}
+expected_3d = expected_mode == "3D"
+required_event_keys = {"params_in", "lower_bound", "upper_bound", "event_name", "likelihood_mode", "uses_z_form", "uses_sfr_prior", "uses_logZ_given_z_prior"}
+required_event_files = {"points.npy", "log_w.npy", "log_z.npy", "metadata.npz"}
+required_injection_keys = {"theta", "m1_src", "m2_src", "z_merger", "params", "lower_bound", "upper_bound", "N_inj", "N_merge", "likelihood_mode", "uses_z_form", "uses_sfr_prior", "uses_logZ_given_z_prior"}
+
+def fail(msg):
+    if allow:
+        print(f"OVERRIDE WARNING: {msg}")
+    else:
+        print(f"ERROR: {msg}")
+        print("Set ALLOW_INCONSISTENT_SELECTION_MODEL=True only for an intentional legacy/diagnostic override.")
+        sys.exit(1)
+
+def scalar(npz, key):
+    val = npz[key]
+    if getattr(val, "shape", ()) == ():
+        return val.item()
+    if val.size == 1:
+        item = val.ravel()[0]
+        return item.item() if hasattr(item, "item") else item
+    return val
+
+def as_bool(x):
+    if isinstance(x, (bool, np.bool_)):
+        return bool(x)
+    return str(x).strip().lower() in {"1", "true", "yes", "y"}
+
+if not injections_path or not lvk_found_path:
+    fail("Selection correction is not enabled: both INJECTIONS_PATH and LVK_FOUND_PATH are required by this workflow script.")
+for path, label in [(injections_path, "injection NPZ"), (lvk_found_path, "LVK found injection file")]:
+    if not os.path.isfile(path):
+        print(f"ERROR: Missing {label}: {path}")
+        sys.exit(1)
+
+event_dirs = sorted(os.path.dirname(p) for p in glob.glob(os.path.join(results_root, "*", config_name, "log_z.npy")))
+if len(event_dirs) < 2:
+    print(f"ERROR: Need at least 2 completed {config_name} events; found {len(event_dirs)}.")
+    sys.exit(1)
+
+for d in event_dirs:
+    missing_files = sorted(f for f in required_event_files if not os.path.isfile(os.path.join(d, f)))
+    if missing_files:
+        print(f"ERROR: Event directory {d} is missing required files: {missing_files}")
+        sys.exit(1)
+    meta = np.load(os.path.join(d, "metadata.npz"), allow_pickle=True)
+    missing_keys = sorted(required_event_keys - set(meta.files))
+    if missing_keys:
+        fail(f"Event metadata {d}/metadata.npz is missing mode/required keys: {missing_keys}")
+        continue
+    mode = str(scalar(meta, "likelihood_mode")).upper()
+    flags = {k: as_bool(scalar(meta, k)) for k in ["uses_z_form", "uses_sfr_prior", "uses_logZ_given_z_prior"]}
+    if mode != expected_mode or any(v != expected_3d for v in flags.values()):
+        fail(f"Event metadata in {d} does not match {expected_mode}: likelihood_mode={mode}, flags={flags}")
+
+inj = np.load(injections_path, allow_pickle=True)
+missing_inj = sorted(required_injection_keys - set(inj.files))
+if missing_inj:
+    fail(f"Injection metadata/file is missing required keys: {missing_inj}")
+else:
+    inj_mode = str(scalar(inj, "likelihood_mode")).upper()
+    inj_flags = {k: as_bool(scalar(inj, k)) for k in ["uses_z_form", "uses_sfr_prior", "uses_logZ_given_z_prior"]}
+    if inj_mode != expected_mode or any(v != expected_3d for v in inj_flags.values()):
+        fail(f"Injection metadata does not match {expected_mode}: likelihood_mode={inj_mode}, flags={inj_flags}")
+    if int(np.ravel(inj["N_merge"])[0]) <= 0 or len(inj["z_merger"]) == 0:
+        print("ERROR: Injection catalog has no merging/redshift samples for selection correction.")
+        sys.exit(1)
+
+print(f"Metadata preflight OK: {len(event_dirs)} {expected_mode} events, matching {expected_mode} injections, LVK/Farr selection enabled.")
+PY
+
 # Check for 2D results to compare against
 echo ""
 if [ -f "${DIR_2D}/summary.csv" ]; then
@@ -133,6 +217,7 @@ python hierarchical_backpop_jax.py \
     --num_samples       "${NUM_SAMPLES}" \
     --num_chains        "${NUM_CHAINS}" \
     --lvk_n_found_max   "${LVK_N_FOUND_MAX}" \
+    --allow_inconsistent_selection_model "${ALLOW_INCONSISTENT_SELECTION_MODEL}" \
     2>&1 | tee "${OUTPUT_DIR}/run.log"
 
 # ---------------------------------------------------------------------------
