@@ -382,6 +382,15 @@ python smoke_test_imports.py --skip-cosmic
 pytest tests/test_lightweight_infrastructure.py tests/test_truncated_population_densities.py tests/test_hierarchical_toy_recovery.py tests/test_selection_model_consistency.py tests/test_default_hyperparams.py
 ```
 
+Injection catalogs written by `run_injections.py` keep their full scientific
+arrays in the requested catalog NPZ and write metadata to a separate
+`*_metadata.npz`/JSON sidecar.  Two-dimensional catalogs record `z_form` as an
+auxiliary proposal draw: when explicit `log_q_proposal` weights are present,
+hierarchical selection accounting cancels this auxiliary SFR proposal factor
+rather than leaving a spurious `1/q(z_form)` term.  Three-dimensional catalogs
+draw and evaluate `P(logZ | z_form)` on the exact finite `logZ` support of the
+active BackPop config.
+
 After installing COSMIC, run the full smoke import check with:
 
 ```bash

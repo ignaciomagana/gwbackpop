@@ -93,7 +93,14 @@ def to_jsonable(value: Any) -> Any:
     return str(value)
 
 
-def save_metadata(output_dir_or_file: str | Path, metadata: dict[str, Any], *, npz_name: str = "metadata.npz", json_name: str = "metadata.json") -> None:
+def save_metadata(
+    output_dir_or_file: str | Path,
+    metadata: dict[str, Any],
+    *,
+    npz_name: str = "metadata.npz",
+    json_name: str = "metadata.json",
+    overwrite_existing_npz: bool = False,
+) -> None:
     """Save metadata as machine-readable NPZ and human-readable JSON.
 
     If *output_dir_or_file* has suffix ``.npz``, that exact NPZ path is used and
@@ -103,6 +110,12 @@ def save_metadata(output_dir_or_file: str | Path, metadata: dict[str, Any], *, n
     target = Path(output_dir_or_file)
     if target.suffix == ".npz":
         npz_path = target
+        if npz_path.exists() and not overwrite_existing_npz:
+            raise FileExistsError(
+                f"Refusing to overwrite existing NPZ metadata target {npz_path}. "
+                "Pass overwrite_existing_npz=True only for known metadata files, "
+                "or write metadata to a sidecar path."
+            )
         json_path = target.with_suffix(".json") if json_name == "metadata.json" else target.with_name(json_name)
     else:
         target.mkdir(parents=True, exist_ok=True)

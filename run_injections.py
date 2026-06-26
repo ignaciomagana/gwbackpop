@@ -369,7 +369,7 @@ def compute_log_q_proposal(
     kick_sigma: float = KICK_PROPOSAL_SIGMA,
 ) -> float:
     """Log density of the full injection proposal used by this campaign."""
-    from cosmo_prior import log_prior_logZ_given_z
+    from cosmo_prior import log_prior_logZ_given_z_on_support
 
     theta = np.asarray(theta, dtype=np.float64)
     log_q = 0.0
@@ -390,7 +390,7 @@ def compute_log_q_proposal(
             log_q += float(-np.log(UPPER[i] - LOWER[i]))
     log_q += float(_log_q_z_form(z_form))
     if LIKELIHOOD_MODE == "3D":
-        log_q += float(log_prior_logZ_given_z(log10_Z, z_form))
+        log_q += float(log_prior_logZ_given_z_on_support(log10_Z, z_form, LOGZ_LO, LOGZ_HI))
     return float(log_q)
 
 
@@ -418,17 +418,11 @@ def _draw_z_form(rng: np.random.Generator, max_tries: int = 200) -> float | None
 
 def _draw_logZ_given_z(rng: np.random.Generator, z_form: float,
                         max_tries: int = 50) -> float | None:
-    """Draw logZ from P(logZ | z_form) — truncated Normal via rejection sampling."""
-    from cosmo_prior import _log_Z_mean_interp, _SIGMA_LOG_Z, _LOG_Z_MIN, _LOG_Z_MAX
+    """Draw logZ from P(logZ | z_form), normalized on active config support."""
+    del max_tries
+    from cosmo_prior import draw_logZ_given_z_on_support
 
-    mu  = float(_log_Z_mean_interp(z_form))
-    sig = _SIGMA_LOG_Z
-
-    for _ in range(max_tries):
-        logZ = rng.normal(mu, sig)
-        if _LOG_Z_MIN <= logZ <= _LOG_Z_MAX:
-            return float(logZ)
-    return None
+    return draw_logZ_given_z_on_support(rng, z_form, LOGZ_LO, LOGZ_HI)
 
 
 # ---------------------------------------------------------------------------
@@ -565,6 +559,13 @@ def run_campaign(
         n_merging_injections=int(n_merge),
         random_seed_convention="Deterministic one-to-one seeds: numpy default_rng(seed=i) for injection draw i in [0, n_inj).",
         likelihood_mode=LIKELIHOOD_MODE,
+        uses_z_form=bool(LIKELIHOOD_MODE == "3D"),
+        uses_aux_z_form=True,
+        aux_z_form_proposal="sfr_weighted_comoving_volume",
+        aux_z_form_distribution="log_q_proposal_includes_sfr_prior_density",
+        uses_sfr_prior=bool(LIKELIHOOD_MODE == "3D"),
+        uses_logZ_given_z_prior=bool(LIKELIHOOD_MODE == "3D"),
+        logZ_support=[float(LOGZ_LO), float(LOGZ_HI)],
         coordinate_system=COORDINATE_SYSTEM,
         pdet_path=pdet_path,
         n_workers=int(n_workers),
@@ -598,12 +599,18 @@ def run_campaign(
         config_name           = np.array([config_name]),
         likelihood_mode        = np.array([LIKELIHOOD_MODE]),
         uses_z_form           = np.array([LIKELIHOOD_MODE == "3D"]),
+        uses_aux_z_form       = np.array([True]),
+        aux_z_form_proposal   = np.array(["sfr_weighted_comoving_volume"]),
+        aux_z_form_distribution = np.array(["log_q_proposal_includes_sfr_prior_density"]),
         uses_sfr_prior        = np.array([LIKELIHOOD_MODE == "3D"]),
         uses_logZ_given_z_prior = np.array([LIKELIHOOD_MODE == "3D"]),
         wall_time_s          = np.array([elapsed]),
         metadata             = np.array(metadata, dtype=object),
     )
-    save_metadata(output_path, metadata)
+    catalog_path = os.fspath(output_path)
+    from pathlib import Path
+    metadata_path = Path(catalog_path).with_name(Path(catalog_path).stem + "_metadata.npz")
+    save_metadata(metadata_path, metadata, overwrite_existing_npz=True)
     print(f"  Saved: {output_path}")
 
 
