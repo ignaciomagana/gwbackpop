@@ -68,6 +68,7 @@ import numpy as np
 from argparse import ArgumentParser
 from multiprocessing import Pool, cpu_count
 from scipy.stats import maxwell
+from metadata_utils import base_runtime_metadata, get_package_versions, save_metadata
 
 # ---------------------------------------------------------------------------
 # Default parameter space is loaded from backpop.get_backpop_config().
@@ -544,6 +545,33 @@ def run_campaign(
     print(f"  m1_src range   = [{m1_src.min():.1f}, {m1_src.max():.1f}] M_sun")
     print(f"  z_merger range = [{z_merger.min():.3f}, {z_merger.max():.3f}]")
 
+    proposal_distribution_description = (
+        "Uniform over non-kick BackPop box parameters; vk1/vk2 from exactly "
+        f"truncated Maxwell(scale={KICK_PROPOSAL_SIGMA} km/s) over configured bounds; "
+        "COSMIC kick directions isotropic via uniform sin(phi), uniform theta, "
+        "uniform omega; z_form from SFR-weighted comoving-volume prior on "
+        f"[0,{ZFORM_MAX}]; logZ uniform for 2D mode and P(logZ|z_form) for 3D mode."
+    )
+    metadata = dict(
+        **base_runtime_metadata("."),
+        package_versions=get_package_versions(["numpy", "scipy", "astropy", "cosmic"]),
+        config_name=config_name,
+        proposal_version=PROPOSAL_VERSION,
+        proposal_name=PROPOSAL_NAME,
+        proposal_distribution_description=proposal_distribution_description,
+        log_q_proposal_available=bool(np.all(np.isfinite(log_q_proposal))),
+        fixed_parameters=FIXED_PARAMS,
+        n_total_injections=int(n_inj),
+        n_merging_injections=int(n_merge),
+        random_seed_convention="Deterministic one-to-one seeds: numpy default_rng(seed=i) for injection draw i in [0, n_inj).",
+        likelihood_mode=LIKELIHOOD_MODE,
+        coordinate_system=COORDINATE_SYSTEM,
+        pdet_path=pdet_path,
+        n_workers=int(n_workers),
+        chunk_size=int(chunk_size),
+        wall_time_s=float(elapsed),
+    )
+
     # ---- Save ----
     np.savez(
         output_path,
@@ -573,7 +601,9 @@ def run_campaign(
         uses_sfr_prior        = np.array([LIKELIHOOD_MODE == "3D"]),
         uses_logZ_given_z_prior = np.array([LIKELIHOOD_MODE == "3D"]),
         wall_time_s          = np.array([elapsed]),
+        metadata             = np.array(metadata, dtype=object),
     )
+    save_metadata(output_path, metadata)
     print(f"  Saved: {output_path}")
 
 

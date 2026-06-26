@@ -73,6 +73,7 @@ from cosmo_prior import (
     log_prior_logZ_given_z,
     z_merger_from_t_delay,
 )
+from metadata_utils import base_runtime_metadata, get_package_versions, save_metadata
 
 
 # ---------------------------------------------------------------------------
@@ -555,8 +556,9 @@ def main():
         os.remove(checkpoint)
         print(f"[run_backpop] Checkpoint deleted: {checkpoint}")
 
-    np.savez(
-        os.path.join(output_path, "metadata.npz"),
+    metadata = dict(
+        **base_runtime_metadata("."),
+        package_versions=get_package_versions(["numpy", "scipy", "astropy", "nautilus", "pesummary", "cosmic"]),
         event_name              = opts.event_name,
         config_name             = opts.config_name,
         likelihood_mode         = mode_tag,
@@ -584,7 +586,14 @@ def main():
         pe_prior_weighting_used = gw_metadata["pe_prior_weighting_used"],
         mass_column_names       = gw_metadata["mass_column_names"],
         wall_time_s             = time.time() - start,
+        samples_path            = opts.samples_path,
+        pe_approximant          = opts.approximant,
+        mass_frame_requested    = opts.mass_frame,
+        mass_frame_interpretation = f"requested={opts.mass_frame}; used={gw_metadata['mass_frame_used']}",
+        pe_prior_weighting_setting = bool(opts.use_pe_weights),
+        support_gate_settings   = dict(policy=opts.support_gate, hdi=opts.support_hdi, q_bounds=q_bounds, mc_bounds=mc_bounds, z_bounds=z_bounds if z_bounds is not None else [None, None]),
     )
+    save_metadata(output_path, metadata)
 
     elapsed = time.time() - start
     print(f"[run_backpop] Done.  Wall time: {elapsed/3600:.2f} hr ({elapsed:.0f} s)")

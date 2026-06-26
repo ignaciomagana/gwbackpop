@@ -46,6 +46,7 @@ import warnings
 from argparse import ArgumentParser
 
 import numpy as np
+from metadata_utils import load_metadata_prefer_json
 import pandas as pd
 import matplotlib
 import matplotlib.pyplot as plt
@@ -200,9 +201,7 @@ def load_results(results_dir: str, n_samples: int = 10_000) -> dict:
     idx = np.random.choice(len(points), size=n_samples, replace=True, p=weights)
 
     # ---- Metadata ----
-    meta_raw    = np.load(_path("metadata.npz"), allow_pickle=True)
-    metadata    = {k: meta_raw[k].item() if meta_raw[k].ndim == 0 else meta_raw[k]
-                   for k in meta_raw.files}
+    metadata    = load_metadata_prefer_json(_path("metadata.npz"))
     params      = list(metadata.get('params_in', []))
     event_name  = str(metadata.get('event_name', 'unknown'))
     config_name = str(metadata.get('config_name', 'unknown'))
