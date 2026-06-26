@@ -43,6 +43,8 @@ RESULTS_ROOT="${RESULTS_ROOT:-./results}"
 CONFIG_NAME="lucky_strikes_zform"
 
 INJECTIONS_PATH="${INJECTIONS_PATH:-./injections/gwtc3_cosmic_mergers.npz}"
+# Build with: python run_injections.py --config_name lucky_strikes --output_path "$INJECTIONS_PATH" ...
+INJECTION_CONFIG_NAME="${INJECTION_CONFIG_NAME:-lucky_strikes}"
 LVK_FOUND_PATH="${LVK_FOUND_PATH:-./injections/endo3_bbhpop-LIGO-T2100113-v12.hdf5}"
 
 NUM_WARMUP="${NUM_WARMUP:-500}"
@@ -79,7 +81,7 @@ z_max = float(data['z_merger'].max())
 if z_max > 10:
     print(f'ERROR: z_merger max = {z_max:.1f} in injection NPZ.')
     print('The pre-fix cosmo_prior.py was used — z_merger values are wrong.')
-    print('Delete the NPZ and re-run run_injections.py with the fixed cosmo_prior.py.')
+    print('Delete the NPZ and re-run run_injections.py --config_name lucky_strikes with the fixed cosmo_prior.py.')
     sys.exit(1)
 print(f'Injection NPZ valid: z_merger max = {z_max:.3f}')
 " || exit 1

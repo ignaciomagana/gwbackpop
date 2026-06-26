@@ -69,19 +69,34 @@ from multiprocessing import Pool, cpu_count
 from scipy.stats import maxwell
 
 # ---------------------------------------------------------------------------
-# Parameter space (same as backpop.get_backpop_config 'lucky_strikes')
-# z_form and logZ are drawn separately from the SFR prior — not from π₀
+# Default parameter space is loaded from backpop.get_backpop_config().
+# These module globals are initialised to the default config for import-time
+# helpers/tests, and overwritten in worker processes by _worker_init().
 # ---------------------------------------------------------------------------
 
-PARAMS = [
-    'm1', 'q', 'logtb',
-    'alpha_1', 'alpha_2', 'flim_1', 'flim_2',
-    'vk1', 'theta1', 'phi1', 'omega1',
-    'vk2', 'theta2', 'phi2', 'omega2',
-]
+DEFAULT_CONFIG_NAME = "lucky_strikes"
 
-LOWER = np.array([50,  0.01, 0.0,   0.1, 0.1, 0.0, 0.0,   0,   0, -90,   0,   0,   0, -90,   0])
-UPPER = np.array([150, 1.0,  3.699, 20,  20,  1.0, 1.0, 500, 360,  90, 360, 500, 360,  90, 360])
+
+def _load_config(config_name: str):
+    from backpop import get_backpop_config
+
+    if config_name.endswith("_zform"):
+        raise NotImplementedError(
+            f"Injection campaigns for config_name={config_name!r} are not implemented. "
+            "Those configs sample z_form in the event likelihood; the injection "
+            "proposal must be updated to record the same physical z_form proposal "
+            "before they can be used consistently."
+        )
+    lower_bound, upper_bound, params_in, fixed_params = get_backpop_config(config_name)
+    return (
+        np.asarray(lower_bound, dtype=np.float64),
+        np.asarray(upper_bound, dtype=np.float64),
+        list(params_in),
+        dict(fixed_params),
+    )
+
+
+LOWER, UPPER, PARAMS, FIXED_PARAMS = _load_config(DEFAULT_CONFIG_NAME)
 
 # Kick velocity injection proposal: Maxwellian(KICK_PROPOSAL_SIGMA km/s)
 # The uniform prior [0, 500] has f_merge ~ 0 because large kicks disrupt all binaries.
@@ -107,12 +122,13 @@ ZFORM_MAX = 20.0
 # Worker function (runs in subprocess — must be importable at module level)
 # ---------------------------------------------------------------------------
 
-def _worker_init(pdet_path: str | None) -> None:
+def _worker_init(pdet_path: str | None, config_name: str = DEFAULT_CONFIG_NAME) -> None:
     """Load P_det interpolator once per worker process.
     If pdet_path is None, P_det evaluation is skipped and pdet=nan is stored.
     Use this mode when building the COSMIC merger catalog for LVKInjectionCampaign.
     """
-    global _PDET
+    global _PDET, LOWER, UPPER, PARAMS, FIXED_PARAMS
+    LOWER, UPPER, PARAMS, FIXED_PARAMS = _load_config(config_name)
     if pdet_path is None:
         _PDET = None
         return
@@ -140,11 +156,14 @@ def _run_one(seed: int) -> dict | None:
 
     # Overwrite vk1 and vk2 with exactly truncated Maxwellian draws.
     # Do not clip: clipping would create an atom at the upper bound.
-    params_dict['vk1'] = _draw_truncated_maxwell(rng, KICK_PROPOSAL_SIGMA, 0.0, UPPER[PARAMS.index('vk1')])
-    params_dict['vk2'] = _draw_truncated_maxwell(rng, KICK_PROPOSAL_SIGMA, 0.0, UPPER[PARAMS.index('vk2')])
-    # Reflect truncation into theta for storage
-    theta[PARAMS.index('vk1')] = params_dict['vk1']
-    theta[PARAMS.index('vk2')] = params_dict['vk2']
+    for kick_name in ('vk1', 'vk2'):
+        if kick_name in PARAMS:
+            i_kick = PARAMS.index(kick_name)
+            params_dict[kick_name] = _draw_truncated_maxwell(
+                rng, KICK_PROPOSAL_SIGMA, LOWER[i_kick], UPPER[i_kick]
+            )
+            # Reflect truncation into theta for storage.
+            theta[i_kick] = params_dict[kick_name]
 
     # ---- Draw z_form from SFR prior via inverse CDF (rejection sampling) ----
     # Import here so the worker subprocess gets its own copy
@@ -160,6 +179,11 @@ def _run_one(seed: int) -> dict | None:
         return None
 
     params_dict['logZ'] = log10_Z
+    if 'logZ' in PARAMS:
+        theta[PARAMS.index('logZ')] = log10_Z
+    if 'z_form' in PARAMS:
+        # Guard against future direct worker calls if _load_config was bypassed.
+        raise NotImplementedError("z_form injection parameters are not implemented")
 
     log_q_proposal = compute_log_q_proposal(theta, z_form, log10_Z, KICK_PROPOSAL_SIGMA)
     if not np.isfinite(log_q_proposal):
@@ -169,7 +193,7 @@ def _run_one(seed: int) -> dict | None:
     try:
         from backpop import evolv2
         final_state, bpp_raw, _ = evolv2(
-            params_dict, ['mass_1', 'mass_2'], fixed_params={}
+            params_dict, ['mass_1', 'mass_2'], fixed_params=FIXED_PARAMS
         )
     except Exception:
         return None
@@ -275,11 +299,16 @@ def compute_log_q_proposal(
     theta = np.asarray(theta, dtype=np.float64)
     log_q = 0.0
     for i, name in enumerate(PARAMS):
+        if not (LOWER[i] <= theta[i] <= UPPER[i]):
+            return -np.inf
         if name in ("vk1", "vk2"):
             log_q += float(_truncated_maxwell_logpdf(theta[i], kick_sigma, LOWER[i], UPPER[i]))
+        elif name == "logZ":
+            # logZ is proposed from P(logZ | z_form), not uniformly.
+            continue
+        elif name == "z_form":
+            raise NotImplementedError("z_form injection proposal is not implemented")
         else:
-            if not (LOWER[i] <= theta[i] <= UPPER[i]):
-                return -np.inf
             log_q += float(-np.log(UPPER[i] - LOWER[i]))
     log_q += float(_log_q_z_form(z_form))
     log_q += float(log_prior_logZ_given_z(log10_Z, z_form))
@@ -350,6 +379,10 @@ def run_campaign(
     chunk_size : int
         Seeds per Pool.map call — balances overhead vs memory.
     """
+    config_name = config_name or DEFAULT_CONFIG_NAME
+    global LOWER, UPPER, PARAMS, FIXED_PARAMS
+    LOWER, UPPER, PARAMS, FIXED_PARAMS = _load_config(config_name)
+
     os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
     start = time.time()
 
@@ -367,7 +400,7 @@ def run_campaign(
     with Pool(
         processes=n_workers,
         initializer=_worker_init,
-        initargs=(pdet_path,),
+        initargs=(pdet_path, config_name),
     ) as pool:
         for i in range(0, n_inj, chunk_size):
             batch = seeds[i : i + chunk_size]
@@ -439,6 +472,7 @@ def run_campaign(
         params       = PARAMS,
         lower_bound  = LOWER,
         upper_bound  = UPPER,
+        fixed_params = np.array(FIXED_PARAMS, dtype=object),
         N_inj                = np.array([n_inj]),
         N_merge              = np.array([n_merge]),
         N_workers            = np.array([n_workers]),
@@ -446,7 +480,7 @@ def run_campaign(
         proposal_name         = np.array([PROPOSAL_NAME]),
         proposal_version      = np.array([PROPOSAL_VERSION]),
         coordinate_system     = np.array([COORDINATE_SYSTEM]),
-        config_name           = np.array([config_name or ""]),
+        config_name           = np.array([config_name]),
         wall_time_s          = np.array([elapsed]),
     )
     print(f"  Saved: {output_path}")
@@ -473,8 +507,8 @@ def parse_args():
                    help="Seeds per pool.map call (default 500).")
     p.add_argument("--dry_run",     type=str, default='False',
                    help="If True, run n_inj=10000 to estimate merger fraction only.")
-    p.add_argument("--config_name", default=None,
-                   help="Optional BackPop config name stored as injection metadata.")
+    p.add_argument("--config_name", default=DEFAULT_CONFIG_NAME,
+                   help="BackPop config name whose params/bounds are used for injections (default: lucky_strikes).")
     return p.parse_args()
 
 
