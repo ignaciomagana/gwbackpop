@@ -70,7 +70,7 @@ from backpop import (
 )
 from cosmo_prior import (
     log_prior_z_form,
-    log_prior_logZ_given_z,
+    log_prior_logZ_given_z_on_support,
     z_merger_from_t_delay,
 )
 from metadata_utils import base_runtime_metadata, get_package_versions, save_metadata
@@ -191,6 +191,7 @@ def likelihood_2d(
     mc_bounds: tuple[float, float],
     support_gate: str,
     fixed_params: dict,
+    logZ_support: tuple[float, float],
 ) -> tuple[float, np.ndarray, np.ndarray]:
     """Log-likelihood for the 2D (mc, q) KDE mode.
 
@@ -316,7 +317,7 @@ def likelihood_3d(
     if not np.isfinite(lp_z):
         return -np.inf, nan_bpp, nan_kick
 
-    lp_logZ = log_prior_logZ_given_z(log10_Z, z_form)
+    lp_logZ = log_prior_logZ_given_z_on_support(log10_Z, z_form, logZ_support[0], logZ_support[1])
     if not np.isfinite(lp_logZ):
         return -np.inf, nan_bpp, nan_kick
 
@@ -507,6 +508,10 @@ def main():
             z_bounds=z_bounds,
             support_gate=opts.support_gate,
             fixed_params=fixed_params,
+            logZ_support=(
+                float(lower_bound[params_in_names.index("logZ")]),
+                float(upper_bound[params_in_names.index("logZ")]),
+            ),
         )
     else:
         lhood = partial(

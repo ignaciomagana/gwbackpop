@@ -219,17 +219,43 @@ def log_prior_logZ_given_z(log10_Z: float, z_form: float) -> float:
     float
         Log prior density. Returns -inf if outside [log10 Z_min, log10 Z_max].
     """
-    if log10_Z < _LOG_Z_MIN or log10_Z > _LOG_Z_MAX:
+    return log_prior_logZ_given_z_on_support(log10_Z, z_form, _LOG_Z_MIN, _LOG_Z_MAX)
+
+
+def log_prior_logZ_given_z_on_support(log10_Z: float, z_form: float, lo: float, hi: float) -> float:
+    """Log P(log10 Z | z_form) normalized on the caller's finite support.
+
+    BackPop configurations may choose a narrower metallicity interval than the
+    default COSMIC/Andrews range.  Injection proposals and population
+    numerators must use exactly the same ``[lo, hi]`` normalization.
+    """
+    lo = float(lo)
+    hi = float(hi)
+    if not lo < hi:
+        raise ValueError("logZ support must satisfy lo < hi")
+    if log10_Z < lo or log10_Z > hi:
         return -np.inf
 
     log10_Z_mean = float(_log_Z_mean_interp(z_form))
 
     # Truncated normal: standardise to unit normal, compute truncation limits
-    a = (_LOG_Z_MIN - log10_Z_mean) / _SIGMA_LOG_Z
-    b = (_LOG_Z_MAX - log10_Z_mean) / _SIGMA_LOG_Z
+    a = (lo - log10_Z_mean) / _SIGMA_LOG_Z
+    b = (hi - log10_Z_mean) / _SIGMA_LOG_Z
     x = (log10_Z - log10_Z_mean) / _SIGMA_LOG_Z
 
     return float(truncnorm.logpdf(x, a, b) - np.log(_SIGMA_LOG_Z))
+
+
+def draw_logZ_given_z_on_support(rng: np.random.Generator, z_form: float, lo: float, hi: float) -> float:
+    """Draw log10(Z) from P(log10 Z | z_form) normalized on ``[lo, hi]``."""
+    lo = float(lo)
+    hi = float(hi)
+    if not lo < hi:
+        raise ValueError("logZ support must satisfy lo < hi")
+    mu = float(_log_Z_mean_interp(z_form))
+    a = (lo - mu) / _SIGMA_LOG_Z
+    b = (hi - mu) / _SIGMA_LOG_Z
+    return float(truncnorm.rvs(a, b, loc=mu, scale=_SIGMA_LOG_Z, random_state=rng))
 
 
 def z_merger_from_t_delay(z_form: float, t_delay_myr: float) -> float | None:

@@ -50,6 +50,17 @@ def test_metadata_writes_npz_and_json_round_trip(tmp_path):
     assert raw["array"] == [1, 2]
 
 
+def test_metadata_refuses_to_overwrite_existing_npz_unless_explicit(tmp_path):
+    catalog = tmp_path / "catalog.npz"
+    np.savez(catalog, theta=np.ones((1, 2)))
+
+    with pytest.raises(FileExistsError, match="Refusing to overwrite"):
+        save_metadata(catalog, {"metadata_only": True})
+
+    save_metadata(catalog, {"metadata_only": True}, overwrite_existing_npz=True)
+    assert "metadata_only" in np.load(catalog, allow_pickle=True).files
+
+
 def test_toy_hierarchical_likelihood_prefers_matching_population():
     samples = hb.jnp.array([[1.0, 0.5], [1.2, 0.5], [1.1, 0.6], [0.9, 0.4]], dtype=hb.jnp.float64)
     pidx = {"alpha_1": 0, "flim_1": 1}
@@ -60,6 +71,12 @@ def test_toy_hierarchical_likelihood_prefers_matching_population():
         [log_wr_fn], hb.jnp.array([0.0], dtype=hb.jnp.float64), samples.shape[0], None, 1
     )
 
-    good = hb.jnp.array([math.log(1.0), 0.25, 0.5, 10.0, math.log(120.0)], dtype=hb.jnp.float64)
-    bad = hb.jnp.array([math.log(5.0), 0.25, 4.0, 10.0, math.log(120.0)], dtype=hb.jnp.float64)
+    good_np = np.asarray(hb.default_hyperparams(), dtype=float)
+    bad_np = good_np.copy()
+    good_np[0] = math.log(1.0)
+    good_np[1] = 0.25
+    bad_np[0] = math.log(5.0)
+    bad_np[1] = 0.25
+    good = hb.jnp.array(good_np, dtype=hb.jnp.float64)
+    bad = hb.jnp.array(bad_np, dtype=hb.jnp.float64)
     assert float(ll(good)) > float(ll(bad))

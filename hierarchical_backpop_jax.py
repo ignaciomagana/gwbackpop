@@ -1579,6 +1579,7 @@ def main():
         injection_model_metadata.update({
             "likelihood_mode": _npz_scalar(cosmic_raw, "likelihood_mode", injection_model_metadata.get("likelihood_mode", "3D" if "z_form" in cosmic_raw else "2D")),
             "uses_z_form": _npz_scalar(cosmic_raw, "uses_z_form", injection_model_metadata.get("uses_z_form", "z_form" in cosmic_raw)),
+            "uses_aux_z_form": _npz_scalar(cosmic_raw, "uses_aux_z_form", injection_model_metadata.get("uses_aux_z_form", False)),
             "uses_sfr_prior": _npz_scalar(cosmic_raw, "uses_sfr_prior", injection_model_metadata.get("uses_sfr_prior", "z_form" in cosmic_raw)),
             "uses_logZ_given_z_prior": _npz_scalar(cosmic_raw, "uses_logZ_given_z_prior", injection_model_metadata.get("uses_logZ_given_z_prior", "z_form" in cosmic_raw and "logZ" in cosmic_raw)),
             "proposal_version": _npz_scalar(cosmic_raw, "proposal_version", injection_model_metadata.get("proposal_version", "unknown")),
@@ -1593,25 +1594,33 @@ def main():
             log_q_arr = cosmic_raw['log_q_proposal'].astype(np.float64)
             if not np.all(np.isfinite(log_q_arr)):
                 raise ValueError("log_q_proposal contains non-finite values")
-            from cosmo_prior import log_prior_z_form, log_prior_logZ_given_z
+            from cosmo_prior import log_prior_z_form, log_prior_logZ_given_z_on_support
             theta_tmp = cosmic_raw['theta'].astype(np.float64)
             params_tmp = list(cosmic_raw['params'])
             lo_tmp = cosmic_raw['lower_bound'].astype(np.float64)
             hi_tmp = cosmic_raw['upper_bound'].astype(np.float64)
             pidx_tmp = {p: i for i, p in enumerate(params_tmp)}
             log_pop_static_arr = np.zeros(theta_tmp.shape[0], dtype=np.float64)
+            inj_sig_for_weights = metadata_model_signature(injection_model_metadata)
             for name in params_tmp:
+                if name == "z_form" and inj_sig_for_weights["uses_sfr_prior"]:
+                    continue
+                if name == "logZ" and inj_sig_for_weights["uses_logZ_given_z_prior"]:
+                    continue
                 if name not in ('alpha_1', 'alpha_2', 'flim_1', 'flim_2', 'vk1', 'vk2'):
                     idx = pidx_tmp[name]
                     log_pop_static_arr += -np.log(hi_tmp[idx] - lo_tmp[idx])
-            inj_sig_for_weights = metadata_model_signature(injection_model_metadata)
-            if (inj_sig_for_weights['uses_z_form'] or inj_sig_for_weights['uses_sfr_prior'] or inj_sig_for_weights['uses_logZ_given_z_prior']) and 'z_form' in cosmic_raw and 'logZ' in cosmic_raw:
+            uses_aux_z_form = _bool_meta(injection_model_metadata.get("uses_aux_z_form"), False)
+            if (inj_sig_for_weights['uses_z_form'] or inj_sig_for_weights['uses_sfr_prior'] or inj_sig_for_weights['uses_logZ_given_z_prior'] or uses_aux_z_form) and 'z_form' in cosmic_raw and 'logZ' in cosmic_raw:
                 zf = cosmic_raw['z_form'].astype(np.float64)
                 lz = cosmic_raw['logZ'].astype(np.float64)
-                if inj_sig_for_weights['uses_sfr_prior']:
+                if inj_sig_for_weights['uses_sfr_prior'] or uses_aux_z_form:
                     log_pop_static_arr += np.array([log_prior_z_form(z) for z in zf])
                 if inj_sig_for_weights['uses_logZ_given_z_prior']:
-                    log_pop_static_arr += np.array([log_prior_logZ_given_z(zmet, z) for zmet, z in zip(lz, zf)])
+                    logz_idx = pidx_tmp.get("logZ")
+                    logz_lo = float(lo_tmp[logz_idx]) if logz_idx is not None else float(injection_model_metadata.get("logZ_support", [-np.inf, np.inf])[0])
+                    logz_hi = float(hi_tmp[logz_idx]) if logz_idx is not None else float(injection_model_metadata.get("logZ_support", [-np.inf, np.inf])[1])
+                    log_pop_static_arr += np.array([log_prior_logZ_given_z_on_support(zmet, z, logz_lo, logz_hi) for zmet, z in zip(lz, zf)])
             else:
                 warnings.warn(
                     "Injection file has log_q_proposal but lacks z_form/logZ; "
