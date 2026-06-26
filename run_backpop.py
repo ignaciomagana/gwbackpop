@@ -219,6 +219,8 @@ def likelihood_2d(
         Support policy applied consistently to KDE observables.
     fixed_params : dict
         Fixed COSMIC parameters.  Bound via partial.
+    logZ_support : tuple[float, float]
+        Active BackPop configuration support for log10 metallicity.
 
     Returns
     -------
@@ -260,6 +262,7 @@ def likelihood_3d(
     z_bounds: tuple[float, float],
     support_gate: str,
     fixed_params: dict,
+    logZ_support: tuple[float, float],
 ) -> tuple[float, np.ndarray, np.ndarray]:
     """Log-likelihood for the 3D (mc, q, z_merger) KDE mode.
 
@@ -296,12 +299,18 @@ def likelihood_3d(
         Support policy applied consistently to KDE observables.
     fixed_params : dict
         Fixed COSMIC parameters.  Bound via partial.
+    logZ_support : tuple[float, float]
+        Active BackPop configuration support for log10 metallicity.
 
     Returns
     -------
     log_prob, bpp_flat, kick_flat
     """
     nan_bpp, nan_kick = _nan_blobs()
+
+    logZ_lo, logZ_hi = map(float, logZ_support)
+    if not logZ_lo < logZ_hi:
+        raise ValueError("logZ_support must satisfy lo < hi")
 
     z_form  = params_in.get('z_form')
     log10_Z = params_in.get('logZ')
@@ -317,7 +326,7 @@ def likelihood_3d(
     if not np.isfinite(lp_z):
         return -np.inf, nan_bpp, nan_kick
 
-    lp_logZ = log_prior_logZ_given_z_on_support(log10_Z, z_form, logZ_support[0], logZ_support[1])
+    lp_logZ = log_prior_logZ_given_z_on_support(log10_Z, z_form, logZ_lo, logZ_hi)
     if not np.isfinite(lp_logZ):
         return -np.inf, nan_bpp, nan_kick
 
@@ -521,6 +530,10 @@ def main():
             mc_bounds=mc_bounds,
             support_gate=opts.support_gate,
             fixed_params=fixed_params,
+            logZ_support=(
+                float(lower_bound[params_in_names.index("logZ")]),
+                float(upper_bound[params_in_names.index("logZ")]),
+            ),
         )
 
     # ---- Nautilus sampler ----
