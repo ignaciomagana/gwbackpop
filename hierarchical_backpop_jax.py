@@ -168,7 +168,11 @@ def default_hyperparams(as_vector: bool = True):
     """
     values = {p["name"]: float(p["default"]) for p in HYPERPARAM_INFO}
     if as_vector:
-        return jnp.array([values[name] for name in POP_PARAM_NAMES], dtype=jnp.float64)
+        # Return a NumPy array rather than a JAX array so callers can freely
+        # make mutable NumPy views/copies when perturbing the initialization
+        # point in tests or diagnostics.  JAX-compiled likelihood helpers
+        # accept this array-like input and convert it as needed.
+        return np.array([values[name] for name in POP_PARAM_NAMES], dtype=np.float64)
     return values
 
 
