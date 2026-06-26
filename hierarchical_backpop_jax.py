@@ -194,7 +194,7 @@ def maxwell_logpdf(x: jnp.ndarray, scale: float | jnp.ndarray) -> jnp.ndarray:
 
     Validated against scipy.stats.maxwell.logpdf(x, scale=sigma).
     """
-    x_safe = jnp.clip(x, 1e-30, None)
+    x_safe = jnp.clip(x, 1e-300, None)
     return (
         0.5 * jnp.log(2.0 / jnp.pi)
         + 2.0 * jnp.log(x_safe)
