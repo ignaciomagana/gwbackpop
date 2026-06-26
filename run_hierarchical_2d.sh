@@ -51,7 +51,10 @@ RESULTS_ROOT="${RESULTS_ROOT:-./results}"
 CONFIG_NAME="lucky_strikes"
 
 INJECTIONS_PATH="${INJECTIONS_PATH:-./injections/gwtc3_cosmic_mergers.npz}"
-# Build with: python run_injections.py --config_name lucky_strikes --output_path "$INJECTIONS_PATH" ...
+# Build with: python run_injections.py --config_name lucky_strikes --likelihood_mode 2D --output_path "$INJECTIONS_PATH" ...
+# The 2D injection metadata must say likelihood_mode=2D, uses_z_form=False,
+# uses_sfr_prior=False, and uses_logZ_given_z_prior=False so selection uses
+# the same flat-logZ/no-population-z_form base measure as the 2D events.
 INJECTION_CONFIG_NAME="${INJECTION_CONFIG_NAME:-lucky_strikes}"
 LVK_FOUND_PATH="${LVK_FOUND_PATH:-./injections/endo3_bbhpop-LIGO-T2100113-v12.hdf5}"
 

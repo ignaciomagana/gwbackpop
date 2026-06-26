@@ -43,8 +43,10 @@ RESULTS_ROOT="${RESULTS_ROOT:-./results}"
 CONFIG_NAME="lucky_strikes_zform"
 
 INJECTIONS_PATH="${INJECTIONS_PATH:-./injections/gwtc3_cosmic_mergers.npz}"
-# Build with: python run_injections.py --config_name lucky_strikes --output_path "$INJECTIONS_PATH" ...
-INJECTION_CONFIG_NAME="${INJECTION_CONFIG_NAME:-lucky_strikes}"
+# Build with: python run_injections.py --config_name lucky_strikes_zform --likelihood_mode 3D --output_path "$INJECTIONS_PATH" ...
+# The 3D injection metadata must say likelihood_mode=3D, uses_z_form=True,
+# uses_sfr_prior=True, and uses_logZ_given_z_prior=True to match 3D events.
+INJECTION_CONFIG_NAME="${INJECTION_CONFIG_NAME:-lucky_strikes_zform}"
 LVK_FOUND_PATH="${LVK_FOUND_PATH:-./injections/endo3_bbhpop-LIGO-T2100113-v12.hdf5}"
 
 NUM_WARMUP="${NUM_WARMUP:-500}"

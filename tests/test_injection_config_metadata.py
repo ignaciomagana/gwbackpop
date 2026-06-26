@@ -56,3 +56,7 @@ def test_saved_injection_bounds_match_backpop_config(tmp_path, monkeypatch):
     np.testing.assert_allclose(saved["lower_bound"], lo)
     np.testing.assert_allclose(saved["upper_bound"], hi)
     assert saved["fixed_params"].item() == fixed
+    assert saved["likelihood_mode"][0] == "2D"
+    assert bool(saved["uses_z_form"][0]) is False
+    assert bool(saved["uses_sfr_prior"][0]) is False
+    assert bool(saved["uses_logZ_given_z_prior"][0]) is False
