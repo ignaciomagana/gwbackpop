@@ -93,6 +93,7 @@ assert jax.numpy.ones(1).dtype == jax.numpy.float64, (
 import sys
 import time
 import glob
+import json
 import warnings
 import numpy as np
 import scipy.stats as sp_stats
@@ -120,26 +121,53 @@ def str2bool(value):
     raise ArgumentTypeError(f"Expected a boolean value, got {value!r}")
 
 # ---------------------------------------------------------------------------
-# Population parameter bounds (must match hierarchical_backpop.py)
+# Population hyperparameter metadata
 # ---------------------------------------------------------------------------
+# NumPyro distributions in ``make_numpyro_model`` are the actual hyperpriors.
+# The metadata below records names, scientifically sensible default values used
+# for JIT compilation/diagnostics, and human-readable descriptions of those
+# NumPyro hyperpriors.  These values are not rectangular sampling bounds.
 
-POP_PARAMS = [
-    # (name,            lo,     hi)
-    ('mu_logalpha1',   -2.0,    3.0),
-    ('sig_logalpha1',   0.01,   3.0),
-    ('mu_logalpha2',   -2.0,    3.0),
-    ('sig_logalpha2',   0.01,   3.0),
-    ('a_f1',            0.1,   10.0),
-    ('b_f1',            0.1,   10.0),
-    ('a_f2',            0.1,   10.0),
-    ('b_f2',            0.1,   10.0),
-    ('sigma_v1',        1.0,  500.0),
-    ('sigma_v2',        1.0,  500.0),
+HYPERPARAM_INFO = [
+    dict(name="mu_logalpha1",  default=0.0,   prior="Normal(0.0, 1.5)"),
+    dict(name="sig_logalpha1", default=0.7,   prior="Exponential(1.0)"),
+    dict(name="mu_logalpha2",  default=0.0,   prior="Normal(0.0, 1.5)"),
+    dict(name="sig_logalpha2", default=0.7,   prior="Exponential(1.0)"),
+    dict(name="a_f1",          default=2.0,   prior="Gamma(2.0, 1.0)"),
+    dict(name="b_f1",          default=2.0,   prior="Gamma(2.0, 1.0)"),
+    dict(name="a_f2",          default=2.0,   prior="Gamma(2.0, 1.0)"),
+    dict(name="b_f2",          default=2.0,   prior="Gamma(2.0, 1.0)"),
+    dict(name="sigma_v1",      default=150.0, prior="HalfNormal(150.0)"),
+    dict(name="sigma_v2",      default=150.0, prior="HalfNormal(150.0)"),
 ]
 
-POP_PARAM_NAMES = [p[0] for p in POP_PARAMS]
-POP_LO          = jnp.array([p[1] for p in POP_PARAMS])
-POP_HI          = jnp.array([p[2] for p in POP_PARAMS])
+POP_PARAM_NAMES = [p["name"] for p in HYPERPARAM_INFO]
+HYPERPRIOR_DESCRIPTIONS = {p["name"]: p["prior"] for p in HYPERPARAM_INFO}
+
+# Physical support for event/injection variables.  These are supports of the
+# population density factors and single-event/injection proposals, not support
+# bounds for NumPyro hyperparameter sampling.  Concrete event/injection runs can
+# provide tighter finite alpha/vk bounds via metadata loaded from disk.
+EVENT_INJECTION_SUPPORT_BOUNDS = {
+    "alpha_1": (0.0, jnp.inf),
+    "alpha_2": (0.0, jnp.inf),
+    "flim_1": (0.0, 1.0),
+    "flim_2": (0.0, 1.0),
+    "vk1": (0.0, jnp.inf),
+    "vk2": (0.0, jnp.inf),
+}
+
+def default_hyperparams(as_vector: bool = True):
+    """Return a valid, explicit hyperparameter initialization point.
+
+    This point is used only to trigger JIT compilation and smoke-test the
+    likelihood.  NumPyro priors in :func:`make_numpyro_model` remain the actual
+    hyperpriors used for sampling.
+    """
+    values = {p["name"]: float(p["default"]) for p in HYPERPARAM_INFO}
+    if as_vector:
+        return jnp.array([values[name] for name in POP_PARAM_NAMES], dtype=jnp.float64)
+    return values
 
 
 # ---------------------------------------------------------------------------
@@ -715,7 +743,7 @@ def make_numpyro_model(log_likelihood_fn: callable) -> callable:
     """Wrap the hierarchical log-likelihood as a NumPyro model.
 
     The population hyperparameters use explicit, weakly informative priors
-    chosen for each parameter type instead of flat priors over POP_PARAMS.
+    chosen for each parameter type rather than from rectangular hyperparameter bounds.
     Keep POP_PARAM_NAMES order unchanged when packing the sampled values into
     lp_vec, because downstream likelihood, output, and plotting code assume
     that vector order.
@@ -1468,9 +1496,8 @@ def main():
     # Trigger JIT compilation with a dummy call before NUTS starts
     print(" Triggering JIT compilation (first call is slow — subsequent calls are fast)...")
     t0 = time.time()
-    dummy = jnp.array([0.5] * 10, dtype=jnp.float64)
-    # Map dummy to valid parameter ranges
-    dummy_lp = POP_LO + (POP_HI - POP_LO) * 0.5
+    # Use an explicit valid hyperparameter vector for compilation.
+    dummy_lp = default_hyperparams()
     _ = log_likelihood_fn(dummy_lp)
     print(f" Compilation done in {time.time()-t0:.1f}s. "
           f"Test log_L = {float(_):.3f}")
@@ -1997,6 +2024,9 @@ def main():
         event_names      = event_names,
         config_name      = opts.config_name,
         pop_param_names  = POP_PARAM_NAMES,
+        default_hyperparams = np.array([default_hyperparams(as_vector=False)[k] for k in POP_PARAM_NAMES]),
+        hyperprior_descriptions = np.array(HYPERPRIOR_DESCRIPTIONS, dtype=object),
+        event_injection_support_bounds = np.array(EVENT_INJECTION_SUPPORT_BOUNDS, dtype=object),
         selection_mode   = selection_mode,
         num_warmup       = opts.num_warmup,
         num_samples      = opts.num_samples,
@@ -2023,6 +2053,13 @@ def main():
         event_model_metadata = np.array(event_model_metadata, dtype=object),
         injection_model_metadata = np.array(injection_model_metadata if selection_mode == "lvk_farr" else {}, dtype=object),
     )
+    with open(os.path.join(out_dir, "hyperpriors.json"), "w", encoding="utf-8") as f:
+        json.dump({
+            "hyperparameter_names": POP_PARAM_NAMES,
+            "default_hyperparams": default_hyperparams(as_vector=False),
+            "hyperprior_descriptions": HYPERPRIOR_DESCRIPTIONS,
+            "note": "NumPyro priors are the actual hyperpriors; event_injection_support_bounds describe physical event/injection variables, not hyperparameter sampling bounds.",
+        }, f, indent=2)
 
     print(f"\n Total wall time: {elapsed_total/60:.1f} min")
     print(" Done.")
