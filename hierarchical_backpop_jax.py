@@ -848,21 +848,42 @@ def parse_args():
 # Main
 # ---------------------------------------------------------------------------
 
+def determine_selection_mode(injections_path: str | None, lvk_found_path: str | None) -> str:
+    """Validate selection-effect inputs and return the implemented mode.
+
+    COSMIC injections alone used to select the unimplemented ``interpolator``
+    mode.  That silently skipped selection correction because no interpolator
+    ``log_alpha_fn`` exists in this JAX driver.  Hard-error instead so users do
+    not accidentally run a mislabeled, uncorrected analysis.
+    """
+    has_cosmic = bool(injections_path)
+    has_lvk = bool(lvk_found_path)
+
+    if has_lvk and not has_cosmic:
+        raise ValueError("--lvk_found_path requires --injections_path")
+    if has_cosmic and not has_lvk:
+        raise NotImplementedError(
+            "--injections_path without --lvk_found_path would select the "
+            "unimplemented interpolator selection mode. Provide "
+            "--lvk_found_path to enable the LVK/Farr selection correction, or "
+            "omit --injections_path to run with selection effects disabled."
+        )
+
+    return "lvk_farr" if (has_lvk and has_cosmic) else "none"
+
+
 def main():
     start_time = time.time()
     opts       = parse_args()
     np.random.seed(opts.seed)
 
-    # Determine selection mode
-    has_cosmic = bool(opts.injections_path)
-    has_lvk    = bool(opts.lvk_found_path)
-    if has_lvk and not has_cosmic:
-        raise ValueError("--lvk_found_path requires --injections_path")
-    selection_mode = "lvk_farr" if (has_lvk and has_cosmic) else \
-                     "interpolator" if has_cosmic else "none"
+    selection_mode = determine_selection_mode(
+        opts.injections_path,
+        opts.lvk_found_path,
+    )
 
     # Output directory
-    _tag = {"none": "no_selection", "interpolator": "interp", "lvk_farr": "lvk_farr"}
+    _tag = {"none": "no_selection", "lvk_farr": "lvk_farr"}
     out_dir = opts.output_dir or os.path.join(
         opts.results_root, "hierarchical", opts.config_name, "nuts",
         _tag[selection_mode]
