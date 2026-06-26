@@ -896,6 +896,7 @@ def load_gw_data(
     mass_frame: str = "auto",
     verbose: bool = True,
     return_metadata: bool = False,
+    hdi_prob: float = 0.999,
 ) -> tuple:
     """Load GW posterior samples and build a source-frame KDE likelihood.
 
@@ -931,17 +932,19 @@ def load_gw_data(
         Print available posterior sample keys and KDE diagnostics.
     return_metadata : bool
         If True, append a metadata dictionary describing mass-frame handling.
+    hdi_prob : float
+        Probability mass used for reported HDI support bounds.
 
     Returns
     -------
     kde : scipy.stats.gaussian_kde
         2D KDE over (mc, q) or 3D over (mc, q, z_src).
     q_bounds : tuple[float, float]
-        99.9% HDI of q — used as a soft prior gate in the likelihood.
+        HDI of q using ``hdi_prob`` — used by configured support gates.
     mc_bounds : tuple[float, float]
-        99.9% HDI of mc — for diagnostics and metadata.
+        HDI of mc using ``hdi_prob`` — for diagnostics and metadata.
     z_bounds : tuple[float, float] or None
-        99.9% HDI of z_src in 3D mode; None in 2D mode.
+        HDI of z_src using ``hdi_prob`` in 3D mode; None in 2D mode.
     raw_samples : np.ndarray
         Source-frame samples, shape (N, 2) or (N, 3).
 
@@ -1009,14 +1012,14 @@ def load_gw_data(
     else:
         weights = np.ones(len(m1_src)) / len(m1_src)
 
-    q_lo,  q_hi  = az.hdi(q_src,  hdi_prob=0.999)
-    mc_lo, mc_hi = az.hdi(mc_src, hdi_prob=0.999)
+    q_lo,  q_hi  = az.hdi(q_src,  hdi_prob=hdi_prob)
+    mc_lo, mc_hi = az.hdi(mc_src, hdi_prob=hdi_prob)
 
     if include_redshift:
         # Use the redshift values already implied by the PE D_L samples
         # (consistent with the PE cosmological model internally)
         z_src = redshift
-        z_lo, z_hi = az.hdi(z_src, hdi_prob=0.999)
+        z_lo, z_hi = az.hdi(z_src, hdi_prob=hdi_prob)
 
         raw_samples = np.column_stack([mc_src, q_src, z_src])
         kde = gaussian_kde(raw_samples.T, weights=weights)
