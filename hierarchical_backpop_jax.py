@@ -1127,10 +1127,12 @@ def parse_args():
     sel.add_argument("--injections_path",   default=None)
     sel.add_argument("--lvk_found_path",    default=None)
     sel.add_argument("--lvk_n_inj_total",   type=int,   default=None)
-    sel.add_argument("--lvk_n_found_max",   type=int,   default=5_000,
-                     help="Max LVK found injections to subsample for K matrix. "
-                          "Farr variance scales as 1/N_found. Default 5000 gives "
-                          "~2s/NUTS iter. Increase after confirming convergence.")
+    sel.add_argument("--lvk_n_found_max",   type=int,   default=None,
+                     help="Optional max LVK found injections to subsample for K matrix. "
+                          "By default all found injections are used. If set below "
+                          "N_found, the Farr estimator is explicitly rescaled by "
+                          "N_found_total/N_found_used so alpha remains absolutely "
+                          "normalized.")
     sel.add_argument("--lvk_bandwidth_log_m1", type=float, default=None)
     sel.add_argument("--lvk_bandwidth_log_m2", type=float, default=None)
     sel.add_argument("--lvk_bandwidth_z",      type=float, default=None)
@@ -1166,6 +1168,24 @@ def determine_selection_mode(injections_path: str | None, lvk_found_path: str | 
         )
 
     return "lvk_farr" if (has_lvk and has_cosmic) else "none"
+
+
+def lvk_found_subsample_log_scaling(N_found_total: int, N_found_used: int) -> float:
+    """Return the log correction for LVK found-injection subsampling.
+
+    The Farr estimator sums over the full set of found LVK injections.  If a
+    uniform subset is used to build the K matrix, the unbiased absolute
+    selection estimate is recovered by multiplying the subset sum by
+    ``N_found_total / N_found_used``.  This factor is constant in Lambda, but it
+    is required for correct alpha values, diagnostics, and metadata.
+    """
+    if N_found_total <= 0:
+        raise ValueError("N_found_total must be positive")
+    if N_found_used <= 0:
+        raise ValueError("N_found_used must be positive")
+    if N_found_used > N_found_total:
+        raise ValueError("N_found_used cannot exceed N_found_total")
+    return float(np.log(N_found_total) - np.log(N_found_used))
 
 
 def main():
@@ -1236,6 +1256,9 @@ def main():
     # ---- Selection effects ----
     log_alpha_fn = None
     cosmic_raw   = None   # made available for PPD plots below
+    N_found_total = 0
+    N_found_used = 0
+    lvk_found_subsample_log_scale = 0.0
     lvk_sampling_pdf_metadata = dict(
         verified=False,
         status="not_used",
@@ -1249,19 +1272,26 @@ def main():
         print(f"\n Loading LVK found injections: {opts.lvk_found_path}")
         lvk = load_lvk_injections(opts.lvk_found_path, opts.lvk_n_inj_total, opts.strict_lvk_sampling_pdf)
         lvk_sampling_pdf_metadata = lvk['sampling_pdf_metadata']
-        print(f"  N_found={len(lvk['m1']):,}  N_inj={lvk['N_inj']:,}")
+        N_found_total = len(lvk['m1'])
+        N_found_used = N_found_total
+        lvk_found_subsample_log_scale = lvk_found_subsample_log_scaling(N_found_total, N_found_used)
+        print(f"  N_found={N_found_total:,}  N_inj={lvk['N_inj']:,}")
 
-        # Subsample found injections for speed.
+        # Optionally subsample found injections for speed.  Because the Farr
+        # estimator is a sum over found injections, a uniform subset must be
+        # multiplied by N_found_total/N_found_used.  We add that Lambda-constant
+        # factor to log_norm below so alpha remains absolutely normalized.
         # 284k found injections: K@w matmul takes ~120s/NUTS iter (CPU↔GPU sync).
         # 5k found injections:   ~2s/iter. Farr variance scales as 1/N_found.
-        # 5000 is more than sufficient for 9-47 events.
         n_found_max = opts.lvk_n_found_max
-        if len(lvk['m1']) > n_found_max:
+        if n_found_max is not None and N_found_total > n_found_max:
             rng_sub  = np.random.default_rng(seed=0)
-            idx_sub  = rng_sub.choice(len(lvk['m1']), size=n_found_max, replace=False)
+            idx_sub  = rng_sub.choice(N_found_total, size=n_found_max, replace=False)
             for key in ['m1', 'm2', 'z', 'q_lvk']:
                 lvk[key] = lvk[key][idx_sub]
-            print(f"  Subsampled N_found: {len(idx_sub) + n_found_max:,} → {n_found_max:,}")
+            N_found_used = len(idx_sub)
+            lvk_found_subsample_log_scale = lvk_found_subsample_log_scaling(N_found_total, N_found_used)
+            print(f"  Subsampled N_found: {N_found_total:,} -> {N_found_used:,}")
 
         print(f"\n Loading COSMIC merger catalog: {opts.injections_path}")
         cosmic_raw = np.load(opts.injections_path, allow_pickle=True)
@@ -1325,7 +1355,13 @@ def main():
             }
 
         K_np, log_v, log_norm = build_kernel_matrix_chunked(lvk, cosmic, bandwidth)
+        # Explicit found-injection subsampling normalization.  This is zero
+        # when all found injections are used and positive for uniform
+        # subsamples, preserving the absolute selection fraction.
+        log_norm += lvk_found_subsample_log_scale
         diagnose_lvk_selection_contributions(K_np, log_v)
+        print(f"  LVK found subsampling log scale = {lvk_found_subsample_log_scale:.6g} "
+              f"(N_found_total/N_found_used = {N_found_total:,}/{N_found_used:,})")
         print(f"  log_norm = {log_norm:.3f}")
         print(f"  K matmul: numpy pure_callback (K stays in system RAM).")
 
@@ -1903,6 +1939,9 @@ def main():
         lvk_sampling_pdf_root_attrs = np.array(lvk_sampling_pdf_metadata.get('root_attrs', {}), dtype=object),
         lvk_sampling_pdf_injection_attrs = np.array(lvk_sampling_pdf_metadata.get('injection_attrs', {}), dtype=object),
         lvk_sampling_pdf_dataset_attrs = np.array(lvk_sampling_pdf_metadata.get('dataset_attrs', {}), dtype=object),
+        lvk_N_found_total = N_found_total,
+        lvk_N_found_used = N_found_used,
+        lvk_found_subsample_log_scaling = lvk_found_subsample_log_scale,
     )
 
     print(f"\n Total wall time: {elapsed_total/60:.1f} min")
