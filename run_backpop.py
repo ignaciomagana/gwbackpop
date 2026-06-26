@@ -331,6 +331,8 @@ def parse_args():
                    help="Posterior approximant label in the pesummary file.")
     p.add_argument("--use_pe_weights", type=str_to_bool, default=True,
                    help="Apply Callister (2021) Jacobian reweighting to PE samples.")
+    p.add_argument("--mass_frame", choices=["auto", "source", "detector"], default="auto",
+                   help="Interpret posterior mass columns as source-frame, detector-frame, or auto-detect aliases.")
     p.add_argument("--nlive",  type=int, default=3000,
                    help="Nautilus n_live.  3000 for hard events; 1000 for typical BBH.")
     p.add_argument("--neff",   type=int, default=30000,
@@ -371,11 +373,13 @@ def main():
     print(f"[run_backpop] Output: {output_path}")
 
     # ---- Load GW data ----
-    kde, q_bounds, mc_bounds, z_bounds, raw_samples = load_gw_data(
+    kde, q_bounds, mc_bounds, z_bounds, raw_samples, gw_metadata = load_gw_data(
         opts.samples_path,
         approximant=opts.approximant,
         use_pe_weights=opts.use_pe_weights,
         include_redshift=use_z,
+        mass_frame=opts.mass_frame,
+        return_metadata=True,
     )
 
     # ---- Build prior ----
@@ -487,6 +491,9 @@ def main():
         z_bounds                = (
             z_bounds if z_bounds is not None else np.array([np.nan, np.nan])
         ),
+        mass_frame_used         = gw_metadata["mass_frame_used"],
+        pe_prior_weighting_used = gw_metadata["pe_prior_weighting_used"],
+        mass_column_names       = gw_metadata["mass_column_names"],
         wall_time_s             = time.time() - start,
     )
 

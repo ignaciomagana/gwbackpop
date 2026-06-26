@@ -48,12 +48,93 @@ REFACTORING / CLARITY
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import pandas as pd
 from scipy.interpolate import interp1d
 from astropy.cosmology import Planck15
 from astropy import constants
 from cosmic import _evolvebin
+
+
+_SOURCE_MASS_ALIASES = (
+    ("mass_1_source", "mass_2_source"),
+    ("mass1_source", "mass2_source"),
+    ("m1_source", "m2_source"),
+    ("mass_1_source_frame", "mass_2_source_frame"),
+    ("mass_1_sourceframe", "mass_2_sourceframe"),
+)
+_DETECTOR_MASS_ALIASES = (
+    ("mass_1_detector", "mass_2_detector"),
+    ("mass1_detector", "mass2_detector"),
+    ("m1_detector", "m2_detector"),
+    ("mass_1_det", "mass_2_det"),
+    ("mass1_det", "mass2_det"),
+    ("m1_det", "m2_det"),
+    ("mass_1_detector_frame", "mass_2_detector_frame"),
+    ("mass_1_detectorframe", "mass_2_detectorframe"),
+)
+_AMBIGUOUS_MASS_COLUMNS = ("mass_1", "mass_2")
+
+
+def _find_column_pair(samples, aliases):
+    keys = set(samples.keys())
+    for m1_name, m2_name in aliases:
+        if m1_name in keys and m2_name in keys:
+            return m1_name, m2_name
+    return None
+
+
+def resolve_mass_columns(samples, mass_frame: str = "auto") -> dict:
+    """Resolve posterior mass columns and whether they are source/detector frame."""
+    if mass_frame not in {"auto", "source", "detector"}:
+        raise ValueError("mass_frame must be one of 'auto', 'source', or 'detector'.")
+
+    source_pair = _find_column_pair(samples, _SOURCE_MASS_ALIASES)
+    detector_pair = _find_column_pair(samples, _DETECTOR_MASS_ALIASES)
+    ambiguous_pair = (
+        _AMBIGUOUS_MASS_COLUMNS
+        if all(name in samples for name in _AMBIGUOUS_MASS_COLUMNS)
+        else None
+    )
+
+    warning = None
+    if mass_frame == "source":
+        pair = source_pair or (ambiguous_pair if detector_pair is None else None)
+        if pair is None:
+            raise KeyError("--mass_frame source requested, but no source-frame mass columns were found.")
+        frame = "source"
+        if pair == ambiguous_pair:
+            warning = "Ambiguous mass_1/mass_2 columns interpreted as source-frame because --mass_frame source was requested."
+    elif mass_frame == "detector":
+        pair = detector_pair or (ambiguous_pair if source_pair is None else None)
+        if pair is None:
+            raise KeyError("--mass_frame detector requested, but no detector-frame mass columns were found.")
+        frame = "detector"
+        if pair == ambiguous_pair:
+            warning = "Ambiguous mass_1/mass_2 columns interpreted as detector-frame because --mass_frame detector was requested."
+    elif source_pair is not None:
+        pair = source_pair
+        frame = "source"
+    elif detector_pair is not None:
+        pair = detector_pair
+        frame = "detector"
+    elif ambiguous_pair is not None:
+        pair = ambiguous_pair
+        frame = "detector"
+        warning = (
+            "Posterior samples only contain ambiguous mass_1/mass_2 columns; "
+            "assuming detector-frame masses by repository convention. Pass "
+            "--mass_frame source or --mass_frame detector to make this explicit."
+        )
+    else:
+        raise KeyError("Could not find a recognized pair of mass columns in posterior samples.")
+
+    if warning is not None:
+        warnings.warn(f"[load_gw_data] {warning}", UserWarning, stacklevel=2)
+
+    return {"frame": frame, "columns": pair, "warning": warning}
 
 
 # ---------------------------------------------------------------------------
@@ -812,6 +893,9 @@ def load_gw_data(
     approximant: str = "C01:Mixed",
     use_pe_weights: bool = True,
     include_redshift: bool = False,
+    mass_frame: str = "auto",
+    verbose: bool = True,
+    return_metadata: bool = False,
 ) -> tuple:
     """Load GW posterior samples and build a source-frame KDE likelihood.
 
@@ -835,9 +919,18 @@ def load_gw_data(
         GWTC-2/3 BBH events.  Falls back gracefully if unavailable.
     use_pe_weights : bool
         Apply Callister (2021) Jacobian reweighting to recover the likelihood
-        from the PE posterior samples.  Should be True for all production runs.
+        from the PE posterior samples.  Should be True for production runs only
+        when the PE prior matches the documented Callister/Lucky-Strikes form.
     include_redshift : bool
         If True, build a 3D KDE over (mc, q, z_src) instead of 2D (mc, q).
+    mass_frame : {"auto", "source", "detector"}
+        How to interpret posterior mass columns.  ``auto`` prefers explicit
+        source-frame aliases, then explicit detector-frame aliases, and only
+        falls back to ambiguous ``mass_1``/``mass_2`` with a warning.
+    verbose : bool
+        Print available posterior sample keys and KDE diagnostics.
+    return_metadata : bool
+        If True, append a metadata dictionary describing mass-frame handling.
 
     Returns
     -------
@@ -872,18 +965,37 @@ def load_gw_data(
         approximant = fallback
 
     samples = data.samples_dict[approximant]
-    m1_det  = np.asarray(samples['mass_1'])
-    m2_det  = np.asarray(samples['mass_2'])
-    dL      = np.asarray(samples['luminosity_distance'])
+    sample_keys = list(samples.keys())
+    if verbose:
+        print(f"[load_gw_data] Posterior sample keys ({approximant}): {sample_keys}")
 
-    # Source-frame conversion
+    mass_info = resolve_mass_columns(samples, mass_frame=mass_frame)
+    m1_col, m2_col = mass_info["columns"]
+    m1_raw = np.asarray(samples[m1_col])
+    m2_raw = np.asarray(samples[m2_col])
+    dL = np.asarray(samples['luminosity_distance'])
+
+    # Source-frame conversion.  Explicit source-frame columns must not be
+    # divided by (1+z); detector-frame columns are converted once.
     redshift = zofdL(dL)
-    m1_src   = m1_det / (1.0 + redshift)
-    m2_src   = m2_det / (1.0 + redshift)
+    if mass_info["frame"] == "source":
+        m1_src = m1_raw
+        m2_src = m2_raw
+    elif mass_info["frame"] == "detector":
+        m1_src = m1_raw / (1.0 + redshift)
+        m2_src = m2_raw / (1.0 + redshift)
+    else:
+        raise ValueError(f"Unsupported mass frame: {mass_info['frame']}")
     mc_src   = (m1_src * m2_src)**(3.0/5.0) / (m1_src + m2_src)**(1.0/5.0)
     q_src    = m2_src / m1_src   # ≤ 1
 
-    # Importance weights: inverse PE prior Jacobian (Callister 2021)
+    # Importance weights: inverse PE prior Jacobian (Callister 2021).
+    # This is valid for the standard PE prior documented in Lucky Strikes:
+    # uniform in detector-frame component masses and comoving-volume-like
+    # distance/redshift.  The calculation below always evaluates the Jacobian
+    # in source-frame masses; the selected mass columns only control whether
+    # a (1+z) conversion was required to obtain those source masses.
+    pe_prior_weighting_used = bool(use_pe_weights)
     if use_pe_weights:
         jacobian = (
             dL**2
@@ -909,22 +1021,36 @@ def load_gw_data(
         raw_samples = np.column_stack([mc_src, q_src, z_src])
         kde = gaussian_kde(raw_samples.T, weights=weights)
 
-        print(f"[load_gw_data] 3D KDE ({approximant}): "
-              f"mc=[{mc_lo:.3f},{mc_hi:.3f}] M_sun, "
-              f"q=[{q_lo:.4f},{q_hi:.4f}], "
-              f"z=[{z_lo:.4f},{z_hi:.4f}]")
+        if verbose:
+            print(f"[load_gw_data] 3D KDE ({approximant}): "
+                  f"mc=[{mc_lo:.3f},{mc_hi:.3f}] M_sun, "
+                  f"q=[{q_lo:.4f},{q_hi:.4f}], "
+                  f"z=[{z_lo:.4f},{z_hi:.4f}]")
 
-        return kde, (q_lo, q_hi), (mc_lo, mc_hi), (z_lo, z_hi), raw_samples
+        metadata = {
+            "mass_frame_used": mass_info["frame"],
+            "pe_prior_weighting_used": pe_prior_weighting_used,
+            "mass_column_names": np.array([m1_col, m2_col]),
+        }
+        result = (kde, (q_lo, q_hi), (mc_lo, mc_hi), (z_lo, z_hi), raw_samples)
+        return result + (metadata,) if return_metadata else result
 
     else:
         raw_samples = np.column_stack([mc_src, q_src])
         kde = gaussian_kde(raw_samples.T, weights=weights)
 
-        print(f"[load_gw_data] 2D KDE ({approximant}): "
-              f"mc=[{mc_lo:.3f},{mc_hi:.3f}] M_sun, "
-              f"q=[{q_lo:.4f},{q_hi:.4f}]")
+        if verbose:
+            print(f"[load_gw_data] 2D KDE ({approximant}): "
+                  f"mc=[{mc_lo:.3f},{mc_hi:.3f}] M_sun, "
+                  f"q=[{q_lo:.4f},{q_hi:.4f}]")
 
-        return kde, (q_lo, q_hi), (mc_lo, mc_hi), None, raw_samples
+        metadata = {
+            "mass_frame_used": mass_info["frame"],
+            "pe_prior_weighting_used": pe_prior_weighting_used,
+            "mass_column_names": np.array([m1_col, m2_col]),
+        }
+        result = (kde, (q_lo, q_hi), (mc_lo, mc_hi), None, raw_samples)
+        return result + (metadata,) if return_metadata else result
 
 
 # ---------------------------------------------------------------------------
