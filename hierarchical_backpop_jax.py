@@ -167,64 +167,121 @@ def maxwell_logpdf(x: jnp.ndarray, scale: float | jnp.ndarray) -> jnp.ndarray:
 
 def log_p_alpha_jax(alpha: jnp.ndarray,
                     mu_log: jnp.ndarray,
-                    sig_log: jnp.ndarray) -> jnp.ndarray:
-    """Log-Normal population model for CE efficiency alpha.
+                    sig_log: jnp.ndarray,
+                    lo: float | jnp.ndarray,
+                    hi: float | jnp.ndarray) -> jnp.ndarray:
+    """Truncated LogNormal population model for CE efficiency alpha.
 
-    p(alpha | mu_log, sig_log) = LogNormal(alpha; mu_log, sig_log)
-    where mu_log, sig_log are mean and std of log(alpha) [natural log].
+    The density is normalized on the same finite support as the event and
+    injection samples. Values outside ``[lo, hi]`` receive zero probability
+    (``-inf`` log-density).
     """
-    return dist.LogNormal(mu_log, sig_log).log_prob(jnp.clip(alpha, 1e-30, None))
+    alpha = jnp.asarray(alpha)
+    x_safe = jnp.clip(alpha, 1e-300, None)
+    z_hi = (jnp.log(hi) - mu_log) / sig_log
+    z_lo = (jnp.log(lo) - mu_log) / sig_log
+    log_norm = jnp.log(jsp.special.ndtr(z_hi) - jsp.special.ndtr(z_lo))
+    log_pdf = dist.LogNormal(mu_log, sig_log).log_prob(x_safe) - log_norm
+    return jnp.where((alpha >= lo) & (alpha <= hi), log_pdf, -jnp.inf)
 
 
 def log_p_flim_jax(flim: jnp.ndarray,
                    a: jnp.ndarray,
                    b: jnp.ndarray) -> jnp.ndarray:
-    """Beta population model for stable MT accretion efficiency flim in [0,1]."""
-    return dist.Beta(a, b).log_prob(jnp.clip(flim, 1e-6, 1.0 - 1e-6))
+    """Beta population model for stable MT accretion efficiency flim in [0,1].
+
+    Samples are only clipped by one machine-scale epsilon at exact numerical
+    boundaries before evaluating the Beta log-density. This is a boundary
+    safety measure for posterior samples stored as exactly 0 or 1; values
+    outside [0, 1] still receive zero probability rather than being silently
+    moved into support.
+    """
+    flim = jnp.asarray(flim)
+    eps = 1e-12
+    x_safe = jnp.clip(flim, eps, 1.0 - eps)
+    log_pdf = dist.Beta(a, b).log_prob(x_safe)
+    return jnp.where((flim >= 0.0) & (flim <= 1.0), log_pdf, -jnp.inf)
 
 
-def log_p_vk_jax(vk: jnp.ndarray, sigma_v: jnp.ndarray) -> jnp.ndarray:
-    """Maxwellian population model for natal kick speed vk [km/s]."""
-    return maxwell_logpdf(jnp.clip(vk, 1e-10, None), sigma_v)
+def maxwell_cdf_jax(x: jnp.ndarray, scale: float | jnp.ndarray) -> jnp.ndarray:
+    """CDF of the Maxwell distribution matching :func:`maxwell_logpdf`."""
+    y = jnp.clip(x, 0.0, None) / scale
+    return jsp.special.erf(y / jnp.sqrt(2.0)) - jnp.sqrt(2.0 / jnp.pi) * y * jnp.exp(-0.5 * y**2)
+
+
+def log_p_vk_jax(vk: jnp.ndarray,
+                 sigma_v: jnp.ndarray,
+                 lo: float | jnp.ndarray,
+                 hi: float | jnp.ndarray) -> jnp.ndarray:
+    """Truncated Maxwellian population model for natal kick speed vk [km/s]."""
+    vk = jnp.asarray(vk)
+    log_norm = jnp.log(maxwell_cdf_jax(hi, sigma_v) - maxwell_cdf_jax(lo, sigma_v))
+    log_pdf = maxwell_logpdf(vk, sigma_v) - log_norm
+    return jnp.where((vk >= lo) & (vk <= hi), log_pdf, -jnp.inf)
 
 
 # ---------------------------------------------------------------------------
 # NumPy population weight ratios for COSMIC merger-catalog postprocessing
 # ---------------------------------------------------------------------------
 
-def _maxwell_logpdf_numpy(x: np.ndarray, scale: float) -> np.ndarray:
-    """NumPy Maxwell log-PDF matching :func:`maxwell_logpdf`."""
-    x_safe = np.clip(np.asarray(x, dtype=np.float64), 1e-30, None)
+def _maxwell_logpdf_numpy(
+    x: np.ndarray,
+    scale: float,
+    lo: float | None = None,
+    hi: float | None = None,
+) -> np.ndarray:
+    """NumPy Maxwell log-PDF, optionally truncated to ``[lo, hi]``."""
+    x_arr = np.asarray(x, dtype=np.float64)
+    x_safe = np.clip(x_arr, 1e-300, None)
     scale = float(scale)
-    return (
+    log_pdf = (
         0.5 * np.log(2.0 / np.pi)
         + 2.0 * np.log(x_safe)
         - 3.0 * np.log(scale)
         - x_safe**2 / (2.0 * scale**2)
     )
+    if lo is not None and hi is not None:
+        norm = sp_stats.maxwell.cdf(float(hi), scale=scale) - sp_stats.maxwell.cdf(float(lo), scale=scale)
+        log_pdf = log_pdf - np.log(norm)
+        log_pdf = np.where((x_arr >= float(lo)) & (x_arr <= float(hi)), log_pdf, -np.inf)
+    return log_pdf
 
 
-def _lognormal_logpdf_numpy(x: np.ndarray, mu_log: float, sig_log: float) -> np.ndarray:
-    """NumPy LogNormal log-PDF with the same clipping as the JAX path."""
-    x_safe = np.clip(np.asarray(x, dtype=np.float64), 1e-30, None)
+def _lognormal_logpdf_numpy(
+    x: np.ndarray,
+    mu_log: float,
+    sig_log: float,
+    lo: float | None = None,
+    hi: float | None = None,
+) -> np.ndarray:
+    """NumPy LogNormal log-PDF, optionally truncated to ``[lo, hi]``."""
+    x_arr = np.asarray(x, dtype=np.float64)
+    x_safe = np.clip(x_arr, 1e-300, None)
     sig_log = float(sig_log)
-    return (
+    log_pdf = (
         -np.log(x_safe)
         -np.log(sig_log)
         -0.5 * np.log(2.0 * np.pi)
         -0.5 * ((np.log(x_safe) - float(mu_log)) / sig_log) ** 2
     )
+    if lo is not None and hi is not None:
+        norm = sp_stats.lognorm.cdf(float(hi), s=sig_log, scale=np.exp(float(mu_log))) - sp_stats.lognorm.cdf(float(lo), s=sig_log, scale=np.exp(float(mu_log)))
+        log_pdf = log_pdf - np.log(norm)
+        log_pdf = np.where((x_arr >= float(lo)) & (x_arr <= float(hi)), log_pdf, -np.inf)
+    return log_pdf
 
 
 def _beta_logpdf_numpy(x: np.ndarray, a: float, b: float) -> np.ndarray:
     """NumPy Beta log-PDF with the same clipping as the JAX path."""
     import math
 
-    x_safe = np.clip(np.asarray(x, dtype=np.float64), 1e-6, 1.0 - 1e-6)
+    x_arr = np.asarray(x, dtype=np.float64)
+    x_safe = np.clip(x_arr, 1e-12, 1.0 - 1e-12)
     a = float(a)
     b = float(b)
     log_norm = math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
-    return log_norm + (a - 1.0) * np.log(x_safe) + (b - 1.0) * np.log1p(-x_safe)
+    log_pdf = log_norm + (a - 1.0) * np.log(x_safe) + (b - 1.0) * np.log1p(-x_safe)
+    return np.where((x_arr >= 0.0) & (x_arr <= 1.0), log_pdf, -np.inf)
 
 
 def compute_log_wr_injections_numpy(
@@ -281,13 +338,24 @@ def compute_log_wr_injections_numpy(
             return 0.0
         return float(-np.log(hi[idx] - lo[idx]))
 
+    def _support(name: str) -> tuple[float, float]:
+        idx = param_idx.get(name)
+        if idx is None:
+            return 0.0, 1.0
+        return float(lo[idx]), float(hi[idx])
+
+    a1_lo, a1_hi = _support('alpha_1')
+    a2_lo, a2_hi = _support('alpha_2')
+    v1_lo, v1_hi = _support('vk1')
+    v2_lo, v2_hi = _support('vk2')
+
     inj_a1 = _col('alpha_1')
     if inj_a1 is not None:
-        log_wr += _lognormal_logpdf_numpy(inj_a1, mu_la1, sig_la1) - (0.0 if explicit_q else _log_uniform_proposal('alpha_1'))
+        log_wr += _lognormal_logpdf_numpy(inj_a1, mu_la1, sig_la1, a1_lo, a1_hi) - (0.0 if explicit_q else _log_uniform_proposal('alpha_1'))
 
     inj_a2 = _col('alpha_2')
     if inj_a2 is not None:
-        log_wr += _lognormal_logpdf_numpy(inj_a2, mu_la2, sig_la2) - (0.0 if explicit_q else _log_uniform_proposal('alpha_2'))
+        log_wr += _lognormal_logpdf_numpy(inj_a2, mu_la2, sig_la2, a2_lo, a2_hi) - (0.0 if explicit_q else _log_uniform_proposal('alpha_2'))
 
     inj_f1 = _col('flim_1')
     if inj_f1 is not None:
@@ -299,11 +367,11 @@ def compute_log_wr_injections_numpy(
 
     inj_v1 = _col('vk1')
     if inj_v1 is not None:
-        log_wr += _maxwell_logpdf_numpy(inj_v1, sv1) - (0.0 if explicit_q else _maxwell_logpdf_numpy(inj_v1, kick_sigma))
+        log_wr += _maxwell_logpdf_numpy(inj_v1, sv1, v1_lo, v1_hi) - (0.0 if explicit_q else _maxwell_logpdf_numpy(inj_v1, kick_sigma, v1_lo, v1_hi))
 
     inj_v2 = _col('vk2')
     if inj_v2 is not None:
-        log_wr += _maxwell_logpdf_numpy(inj_v2, sv2) - (0.0 if explicit_q else _maxwell_logpdf_numpy(inj_v2, kick_sigma))
+        log_wr += _maxwell_logpdf_numpy(inj_v2, sv2, v2_lo, v2_hi) - (0.0 if explicit_q else _maxwell_logpdf_numpy(inj_v2, kick_sigma, v2_lo, v2_hi))
 
     return log_wr
 
@@ -354,6 +422,17 @@ def make_log_weight_ratio_fn(
     lpi0_v1 = _log_pi0('vk1')
     lpi0_v2 = _log_pi0('vk2')
 
+    def _support(name):
+        idx = param_idx.get(name)
+        if idx is None:
+            return 0.0, 1.0
+        return float(lo[idx]), float(hi[idx])
+
+    a1_lo, a1_hi = _support('alpha_1')
+    a2_lo, a2_hi = _support('alpha_2')
+    v1_lo, v1_hi = _support('vk1')
+    v2_lo, v2_hi = _support('vk2')
+
     @jit
     def log_weight_ratio(lp_vec: jnp.ndarray) -> jnp.ndarray:
         """Compute log[p(theta^k | Lambda_pop) / pi0(theta^k)] for all k.
@@ -370,17 +449,17 @@ def make_log_weight_ratio_fn(
         log_w = jnp.zeros(samples.shape[0])
 
         if alpha1 is not None:
-            log_w = log_w + log_p_alpha_jax(alpha1, mu_la1, sig_la1) - lpi0_a1
+            log_w = log_w + log_p_alpha_jax(alpha1, mu_la1, sig_la1, a1_lo, a1_hi) - lpi0_a1
         if alpha2 is not None:
-            log_w = log_w + log_p_alpha_jax(alpha2, mu_la2, sig_la2) - lpi0_a2
+            log_w = log_w + log_p_alpha_jax(alpha2, mu_la2, sig_la2, a2_lo, a2_hi) - lpi0_a2
         if flim1 is not None:
             log_w = log_w + log_p_flim_jax(flim1, af1, bf1) - lpi0_f1
         if flim2 is not None:
             log_w = log_w + log_p_flim_jax(flim2, af2, bf2) - lpi0_f2
         if vk1 is not None:
-            log_w = log_w + log_p_vk_jax(vk1, sv1) - lpi0_v1
+            log_w = log_w + log_p_vk_jax(vk1, sv1, v1_lo, v1_hi) - lpi0_v1
         if vk2 is not None:
-            log_w = log_w + log_p_vk_jax(vk2, sv2) - lpi0_v2
+            log_w = log_w + log_p_vk_jax(vk2, sv2, v2_lo, v2_hi) - lpi0_v2
 
         return log_w
 
@@ -470,6 +549,17 @@ def make_log_alpha_fn(
     lpi0_a2 = _log_pi0_inj('alpha_2')
     lpi0_f1 = _log_pi0_inj('flim_1')
     lpi0_f2 = _log_pi0_inj('flim_2')
+
+    def _support_inj(name):
+        idx = param_idx_inj.get(name)
+        if idx is None:
+            return 0.0, 1.0
+        return float(lo_inj[idx]), float(hi_inj[idx])
+
+    a1_lo, a1_hi = _support_inj('alpha_1')
+    a2_lo, a2_hi = _support_inj('alpha_2')
+    v1_lo, v1_hi = _support_inj('vk1')
+    v2_lo, v2_hi = _support_inj('vk2')
     if log_q_proposal is None:
         warnings.warn(
             "Injection file lacks log_q_proposal; falling back to legacy proposal "
@@ -485,8 +575,11 @@ def make_log_alpha_fn(
         static_pop = jnp.zeros(theta_inj.shape[0]) if log_pop_static is None else log_pop_static
 
     # Kick denominator: Maxwellian (injection proposal), not uniform
-    def _log_maxw(vk):
-        return maxwell_logpdf(jnp.clip(vk, 1e-10, None), kick_sigma)
+    def _log_maxw_v1(vk):
+        return log_p_vk_jax(vk, kick_sigma, v1_lo, v1_hi)
+
+    def _log_maxw_v2(vk):
+        return log_p_vk_jax(vk, kick_sigma, v2_lo, v2_hi)
 
     @jit
     def log_alpha(lp_vec: jnp.ndarray) -> jnp.ndarray:
@@ -506,31 +599,31 @@ def make_log_alpha_fn(
         if use_explicit_q:
             log_wr = static_pop - log_q
             if inj_a1 is not None:
-                log_wr = log_wr + log_p_alpha_jax(inj_a1, mu_la1, sig_la1)
+                log_wr = log_wr + log_p_alpha_jax(inj_a1, mu_la1, sig_la1, a1_lo, a1_hi)
             if inj_a2 is not None:
-                log_wr = log_wr + log_p_alpha_jax(inj_a2, mu_la2, sig_la2)
+                log_wr = log_wr + log_p_alpha_jax(inj_a2, mu_la2, sig_la2, a2_lo, a2_hi)
             if inj_f1 is not None:
                 log_wr = log_wr + log_p_flim_jax(inj_f1, af1, bf1)
             if inj_f2 is not None:
                 log_wr = log_wr + log_p_flim_jax(inj_f2, af2, bf2)
             if inj_v1 is not None:
-                log_wr = log_wr + log_p_vk_jax(inj_v1, sv1)
+                log_wr = log_wr + log_p_vk_jax(inj_v1, sv1, v1_lo, v1_hi)
             if inj_v2 is not None:
-                log_wr = log_wr + log_p_vk_jax(inj_v2, sv2)
+                log_wr = log_wr + log_p_vk_jax(inj_v2, sv2, v2_lo, v2_hi)
         else:
             log_wr = jnp.zeros(theta_inj.shape[0])
             if inj_a1 is not None:
-                log_wr = log_wr + log_p_alpha_jax(inj_a1, mu_la1, sig_la1) - lpi0_a1
+                log_wr = log_wr + log_p_alpha_jax(inj_a1, mu_la1, sig_la1, a1_lo, a1_hi) - lpi0_a1
             if inj_a2 is not None:
-                log_wr = log_wr + log_p_alpha_jax(inj_a2, mu_la2, sig_la2) - lpi0_a2
+                log_wr = log_wr + log_p_alpha_jax(inj_a2, mu_la2, sig_la2, a2_lo, a2_hi) - lpi0_a2
             if inj_f1 is not None:
                 log_wr = log_wr + log_p_flim_jax(inj_f1, af1, bf1) - lpi0_f1
             if inj_f2 is not None:
                 log_wr = log_wr + log_p_flim_jax(inj_f2, af2, bf2) - lpi0_f2
             if inj_v1 is not None:
-                log_wr = log_wr + log_p_vk_jax(inj_v1, sv1) - _log_maxw(inj_v1)
+                log_wr = log_wr + log_p_vk_jax(inj_v1, sv1, v1_lo, v1_hi) - _log_maxw_v1(inj_v1)
             if inj_v2 is not None:
-                log_wr = log_wr + log_p_vk_jax(inj_v2, sv2) - _log_maxw(inj_v2)
+                log_wr = log_wr + log_p_vk_jax(inj_v2, sv2, v2_lo, v2_hi) - _log_maxw_v2(inj_v2)
 
         # Numerically stable K @ w via pure_callback (numpy, system RAM).
         # K never enters XLA memory — pure_callback hides it from the allocator.
@@ -1361,7 +1454,7 @@ def main():
                 # PPD of vk: average Maxwell(sigma) over posterior sigma samples
                 ppd_vk = np.zeros_like(vk_grid)
                 for sig in sig_samples[:200]:
-                    ppd_vk += sp_stats.maxwell.pdf(vk_grid, scale=sig)
+                    ppd_vk += np.exp(_maxwell_logpdf_numpy(vk_grid, sig, 0.0, 500.0))
                 ppd_vk /= min(200, len(sig_samples))
 
                 ax.plot(vk_grid, ppd_vk, color=color, linewidth=2,
@@ -1454,11 +1547,13 @@ def main():
         dist_specs = [
             dict(
                 grid=alpha1_grid,
-                pdf=lambda draw: sp_stats.lognorm.pdf(
+                pdf=lambda draw: np.exp(_lognormal_logpdf_numpy(
                     alpha1_grid,
-                    s=draw[POP_PARAM_NAMES.index('sig_logalpha1')],
-                    scale=np.exp(draw[POP_PARAM_NAMES.index('mu_logalpha1')]),
-                ),
+                    draw[POP_PARAM_NAMES.index('mu_logalpha1')],
+                    draw[POP_PARAM_NAMES.index('sig_logalpha1')],
+                    alpha1_lo,
+                    alpha1_hi,
+                )),
                 xlabel=r'$\alpha_1$',
                 ylabel=r'$p(\alpha_1\mid\mathrm{data})$',
                 title=r'CE efficiency $\alpha_1$',
@@ -1467,11 +1562,13 @@ def main():
             ),
             dict(
                 grid=alpha2_grid,
-                pdf=lambda draw: sp_stats.lognorm.pdf(
+                pdf=lambda draw: np.exp(_lognormal_logpdf_numpy(
                     alpha2_grid,
-                    s=draw[POP_PARAM_NAMES.index('sig_logalpha2')],
-                    scale=np.exp(draw[POP_PARAM_NAMES.index('mu_logalpha2')]),
-                ),
+                    draw[POP_PARAM_NAMES.index('mu_logalpha2')],
+                    draw[POP_PARAM_NAMES.index('sig_logalpha2')],
+                    alpha2_lo,
+                    alpha2_hi,
+                )),
                 xlabel=r'$\alpha_2$',
                 ylabel=r'$p(\alpha_2\mid\mathrm{data})$',
                 title=r'CE efficiency $\alpha_2$',
@@ -1506,10 +1603,12 @@ def main():
             ),
             dict(
                 grid=vk1_grid,
-                pdf=lambda draw: sp_stats.maxwell.pdf(
+                pdf=lambda draw: np.exp(_maxwell_logpdf_numpy(
                     vk1_grid,
-                    scale=draw[POP_PARAM_NAMES.index('sigma_v1')],
-                ),
+                    draw[POP_PARAM_NAMES.index('sigma_v1')],
+                    vk1_lo,
+                    vk1_hi,
+                )),
                 xlabel=r'$v_{k,1}$ [km/s]',
                 ylabel=r'$p(v_{k,1}\mid\mathrm{data})$',
                 title=r'Natal kick $v_{k,1}$',
@@ -1518,10 +1617,12 @@ def main():
             ),
             dict(
                 grid=vk2_grid,
-                pdf=lambda draw: sp_stats.maxwell.pdf(
+                pdf=lambda draw: np.exp(_maxwell_logpdf_numpy(
                     vk2_grid,
-                    scale=draw[POP_PARAM_NAMES.index('sigma_v2')],
-                ),
+                    draw[POP_PARAM_NAMES.index('sigma_v2')],
+                    vk2_lo,
+                    vk2_hi,
+                )),
                 xlabel=r'$v_{k,2}$ [km/s]',
                 ylabel=r'$p(v_{k,2}\mid\mathrm{data})$',
                 title=r'Natal kick $v_{k,2}$',
