@@ -41,6 +41,12 @@ Output (./results/<event_name>/<config_name>/):
     log_z.npy      — log evidence (scalar); used in hierarchical step
     blobs.npy      — COSMIC bpp + kick tracks per sample
     metadata.npz   — self-describing run metadata for hierarchical step
+
+Support gates
+-------------
+By default ``--support_gate none`` leaves KDE tails to the KDE rather than
+applying asymmetric ad hoc penalties.  ``hard`` and ``soft`` are available for
+explicit HDI-based support truncation/penalization with ``--support_hdi``.
 """
 
 from __future__ import annotations
@@ -104,11 +110,60 @@ def _merger_observables(final_state) -> tuple[float, float, float]:
     return m1, m2, mc, q
 
 
-def _soft_q_gate(q: float, q_hi: float) -> float | None:
-    """Return a log-penalty if q exceeds the HDI upper limit, else None."""
-    if q > q_hi:
-        return -0.5 * ((q - q_hi) / 0.01)**2 - 100.0
-    return None
+_VALID_SUPPORT_GATES = ("none", "hard", "soft")
+
+
+def _support_gate_penalty(
+    value: float,
+    bounds: tuple[float, float] | None,
+    policy: str,
+    *,
+    soft_scale_fraction: float = 0.01,
+    soft_offset: float = 100.0,
+) -> float | None:
+    """Return a support-gate log penalty, or None when KDE should be used.
+
+    Policies are symmetric around the supplied HDI bounds:
+      - ``none``: never gate; leave all tail behavior to the KDE.
+      - ``hard``: return ``-np.inf`` outside the bounds.
+      - ``soft``: return a quadratic penalty below/above the bounds.
+    """
+    if policy not in _VALID_SUPPORT_GATES:
+        raise ValueError(
+            f"Unsupported support gate '{policy}'. "
+            f"Expected one of {_VALID_SUPPORT_GATES}."
+        )
+    if policy == "none" or bounds is None:
+        return None
+
+    lo, hi = map(float, bounds)
+    if lo <= value <= hi:
+        return None
+    if policy == "hard":
+        return -np.inf
+
+    width = max(hi - lo, np.finfo(float).eps)
+    scale = soft_scale_fraction * width
+    distance = lo - value if value < lo else value - hi
+    return -0.5 * (distance / scale)**2 - soft_offset
+
+
+def _combined_support_gate_penalty(
+    values: dict[str, float],
+    bounds_by_name: dict[str, tuple[float, float] | None],
+    policy: str,
+) -> float | None:
+    """Combine support penalties for all provided observables."""
+    penalties = [
+        _support_gate_penalty(values[name], bounds_by_name.get(name), policy)
+        for name in values
+    ]
+    penalties = [penalty for penalty in penalties if penalty is not None]
+    if not penalties:
+        return None
+    if any(np.isneginf(penalty) for penalty in penalties):
+        return -np.inf
+    return float(np.sum(penalties))
 
 
 def _extract_t_delay_myr(bpp_raw: np.ndarray) -> float | None:
@@ -132,6 +187,8 @@ def likelihood_2d(
     *,
     kde,
     q_bounds: tuple[float, float],
+    mc_bounds: tuple[float, float],
+    support_gate: str,
     fixed_params: dict,
 ) -> tuple[float, np.ndarray, np.ndarray]:
     """Log-likelihood for the 2D (mc, q) KDE mode.
@@ -153,7 +210,11 @@ def likelihood_2d(
     kde : scipy.stats.gaussian_kde
         2D KDE over (mc_src, q_src).  Bound via partial.
     q_bounds : tuple[float, float]
-        (q_lo, q_hi) 99.9% HDI soft gate.  Bound via partial.
+        (q_lo, q_hi) HDI used by the configured support gate.  Bound via partial.
+    mc_bounds : tuple[float, float]
+        (mc_lo, mc_hi) HDI used by the configured support gate.  Bound via partial.
+    support_gate : {"none", "hard", "soft"}
+        Support policy applied consistently to KDE observables.
     fixed_params : dict
         Fixed COSMIC parameters.  Bound via partial.
 
@@ -174,7 +235,9 @@ def likelihood_2d(
 
     _, _, mc, q = _merger_observables(final_state)
 
-    penalty = _soft_q_gate(q, q_bounds[1])
+    penalty = _combined_support_gate_penalty(
+        {"mc": mc, "q": q}, {"mc": mc_bounds, "q": q_bounds}, support_gate
+    )
     if penalty is not None:
         return penalty, bpp_flat, kick_flat
 
@@ -191,7 +254,9 @@ def likelihood_3d(
     *,
     kde,
     q_bounds: tuple[float, float],
+    mc_bounds: tuple[float, float],
     z_bounds: tuple[float, float],
+    support_gate: str,
     fixed_params: dict,
 ) -> tuple[float, np.ndarray, np.ndarray]:
     """Log-likelihood for the 3D (mc, q, z_merger) KDE mode.
@@ -220,9 +285,13 @@ def likelihood_3d(
     kde : scipy.stats.gaussian_kde
         3D KDE over (mc_src, q_src, z_src).  Bound via partial.
     q_bounds : tuple[float, float]
-        (q_lo, q_hi) 99.9% HDI soft gate.  Bound via partial.
+        (q_lo, q_hi) HDI used by the configured support gate.  Bound via partial.
+    mc_bounds : tuple[float, float]
+        (mc_lo, mc_hi) HDI used by the configured support gate.  Bound via partial.
     z_bounds : tuple[float, float]
-        (z_lo, z_hi) 99.9% HDI of merger redshift.  Bound via partial.
+        (z_lo, z_hi) HDI used by the configured support gate.  Bound via partial.
+    support_gate : {"none", "hard", "soft"}
+        Support policy applied consistently to KDE observables.
     fixed_params : dict
         Fixed COSMIC parameters.  Bound via partial.
 
@@ -277,20 +346,18 @@ def likelihood_3d(
     # ---- Merger observables ----
     _, _, mc, q = _merger_observables(final_state)
 
-    # ---- Soft mass-ratio gate ----
-    penalty = _soft_q_gate(q, q_bounds[1])
+    # ---- Configured support policy (mc, q, z) ----
+    penalty = _combined_support_gate_penalty(
+        {"mc": mc, "q": q, "z": z_merger_pred},
+        {"mc": mc_bounds, "q": q_bounds, "z": z_bounds},
+        support_gate,
+    )
     if penalty is not None:
         return penalty + lp_z + lp_logZ, bpp_flat, kick_flat
 
     # ---- 3D KDE likelihood ----
-    # Allow a 3x margin above z_hi before applying a soft penalty, since
-    # the KDE bandwidth handles tails within the HDI naturally.
-    z_hi = z_bounds[1]
-    if z_merger_pred > 3.0 * z_hi:
-        log_ll = -0.5 * ((z_merger_pred - z_hi) / (0.1 * max(z_hi, 1e-3)))**2 - 10.0
-    else:
-        coord  = np.array([[mc], [q], [z_merger_pred]])
-        log_ll = float(kde.logpdf(coord)[0])
+    coord  = np.array([[mc], [q], [z_merger_pred]])
+    log_ll = float(kde.logpdf(coord)[0])
 
     log_prob = log_ll + lp_z + lp_logZ
     return log_prob, bpp_flat, kick_flat
@@ -337,6 +404,13 @@ def parse_args():
                    help="Nautilus n_live.  3000 for hard events; 1000 for typical BBH.")
     p.add_argument("--neff",   type=int, default=30000,
                    help="Nautilus target effective sample size.")
+    p.add_argument("--support_gate", choices=_VALID_SUPPORT_GATES, default="none",
+                   help="Support treatment for KDE observables outside HDI bounds. "
+                        "Default 'none' is safer: it leaves tails to the KDE "
+                        "and avoids one-off asymmetric likelihood penalties.")
+    p.add_argument("--support_hdi", type=float, default=0.999,
+                   help="HDI probability used to define support bounds for "
+                        "--support_gate hard/soft (default: 0.999).")
     p.add_argument("--resume", type=str_to_bool, default=False,
                    help="Resume from existing Nautilus checkpoint.")
     p.add_argument("--max_threads", type=int, default=None,
@@ -348,6 +422,11 @@ def parse_args():
 def main():
     start = time.time()
     opts  = parse_args()
+
+    if not (0.0 < opts.support_hdi <= 1.0):
+        raise ValueError(
+            f"--support_hdi must be in the interval (0, 1]. Got {opts.support_hdi}."
+        )
 
     # ---- Validate config / mode consistency ----
     use_z = opts.use_redshift_likelihood
@@ -380,6 +459,7 @@ def main():
         include_redshift=use_z,
         mass_frame=opts.mass_frame,
         return_metadata=True,
+        hdi_prob=opts.support_hdi,
     )
 
     # ---- Build prior ----
@@ -422,7 +502,9 @@ def main():
             likelihood_3d,
             kde=kde,
             q_bounds=q_bounds,
+            mc_bounds=mc_bounds,
             z_bounds=z_bounds,
+            support_gate=opts.support_gate,
             fixed_params=fixed_params,
         )
     else:
@@ -430,6 +512,8 @@ def main():
             likelihood_2d,
             kde=kde,
             q_bounds=q_bounds,
+            mc_bounds=mc_bounds,
+            support_gate=opts.support_gate,
             fixed_params=fixed_params,
         )
 
@@ -489,6 +573,8 @@ def main():
         neff                    = opts.neff,
         n_eff_actual            = n_eff_actual,
         log_z                   = log_z,
+        support_gate            = opts.support_gate,
+        support_hdi             = opts.support_hdi,
         q_bounds                = q_bounds,
         mc_bounds               = mc_bounds,
         z_bounds                = (
