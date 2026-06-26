@@ -1174,6 +1174,185 @@ def diagnose_lvk_selection_contributions(K: np.ndarray, log_v: jnp.ndarray, labe
     print("    contribution quantiles [0,5,50,95,99,100]%: " + ", ".join(f"{q:.3e}" for q in qs))
     print(f"    top 1 / 10 / 100 cumulative fractions: {top[:1].sum():.3f} / {top[:10].sum():.3f} / {top[:100].sum():.3f}")
 
+
+def _importance_weight_summary_from_log_weights(log_w: np.ndarray) -> dict:
+    """Return stable ESS and dominance diagnostics for non-negative log weights."""
+    log_w = np.asarray(log_w, dtype=np.float64)
+    finite = np.isfinite(log_w)
+    n_total = int(log_w.size)
+    n_finite = int(finite.sum())
+    if n_finite == 0:
+        return dict(n_total=n_total, n_finite=0, ess=0.0, ess_fraction=0.0,
+                    max_normalized_weight=np.nan, warning="SEVERE")
+
+    lw = log_w[finite]
+    lw_max = np.max(lw)
+    w = np.exp(lw - lw_max)
+    w_sum = w.sum()
+    w2_sum = np.square(w).sum()
+    if (not np.isfinite(w_sum)) or w_sum <= 0.0 or (not np.isfinite(w2_sum)) or w2_sum <= 0.0:
+        return dict(n_total=n_total, n_finite=n_finite, ess=0.0, ess_fraction=0.0,
+                    max_normalized_weight=np.nan, warning="SEVERE")
+
+    norm_w = w / w_sum
+    ess = float(w_sum * w_sum / w2_sum)
+    ess_fraction = ess / n_total if n_total > 0 else 0.0
+    if ess_fraction < 0.01:
+        warning = "SEVERE"
+    elif ess_fraction < 0.05:
+        warning = "WARN"
+    else:
+        warning = "OK"
+    return dict(n_total=n_total, n_finite=n_finite, ess=ess,
+                ess_fraction=float(ess_fraction),
+                max_normalized_weight=float(np.max(norm_w)),
+                warning=warning)
+
+
+def compute_event_reweighting_diagnostics(
+    lp_vec: np.ndarray,
+    label: str,
+    log_wr_fns: list[callable],
+    event_names: list[str],
+) -> list[dict]:
+    """Compute per-event posterior importance-weight ESS diagnostics."""
+    rows = []
+    for event_name, wr_fn in zip(event_names, log_wr_fns):
+        log_w = np.asarray(wr_fn(jnp.array(lp_vec, dtype=jnp.float64)), dtype=np.float64)
+        summary = _importance_weight_summary_from_log_weights(log_w)
+        rows.append(dict(
+            hyperpoint=label,
+            event_name=event_name,
+            raw_posterior_sample_count=summary["n_total"],
+            finite_weight_count=summary["n_finite"],
+            importance_ess=summary["ess"],
+            ess_fraction=summary["ess_fraction"],
+            max_normalized_weight=summary["max_normalized_weight"],
+            warning=summary["warning"],
+        ))
+    return rows
+
+
+def print_event_reweighting_diagnostics(rows: list[dict], label: str) -> None:
+    """Print a compact table of per-event reweighting quality."""
+    print(f"\n Posterior reweighting diagnostics ({label}):")
+    print(f"  {'event':<28s} {'N_raw':>8s} {'ESS':>10s} {'ESS/N':>8s} {'max w':>10s} {'flag':>8s}")
+    print("  " + "-" * 78)
+    for row in rows:
+        print(f"  {row['event_name']:<28.28s} "
+              f"{row['raw_posterior_sample_count']:8d} "
+              f"{row['importance_ess']:10.1f} "
+              f"{row['ess_fraction']:8.4f} "
+              f"{row['max_normalized_weight']:10.3e} "
+              f"{row['warning']:>8s}")
+
+
+def write_event_reweighting_diagnostics_csv(path: str, rows: list[dict]) -> None:
+    import csv
+    fields = [
+        "hyperpoint", "event_name", "raw_posterior_sample_count",
+        "finite_weight_count", "importance_ess", "ess_fraction",
+        "max_normalized_weight", "warning",
+    ]
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def compute_selection_weight_diagnostics(
+    lp_vec: np.ndarray,
+    label: str,
+    K_np: np.ndarray,
+    log_v: jnp.ndarray,
+    cosmic: dict,
+) -> dict:
+    """Compute found-injection contribution degeneracy diagnostics for alpha."""
+    log_wr = compute_log_wr_injections_numpy(
+        lp_vec,
+        cosmic["theta"],
+        cosmic["params"],
+        cosmic["lo"],
+        cosmic["hi"],
+        cosmic["kick_sigma"],
+        cosmic.get("log_q_proposal"),
+        cosmic.get("log_pop_static"),
+    )
+    finite_wr = np.isfinite(log_wr)
+    if not finite_wr.any() or K_np.size == 0:
+        return dict(hyperpoint=label, found_injection_count=int(K_np.shape[0]),
+                    cosmic_merger_count=int(K_np.shape[1]) if K_np.ndim == 2 else 0,
+                    positive_contribution_count=0, injection_ess=0.0,
+                    ess_fraction=0.0, max_contribution=np.nan,
+                    top_1pct_alpha_fraction=np.nan,
+                    top_0p1pct_alpha_fraction=np.nan,
+                    warning="SEVERE")
+
+    lw_max = np.max(log_wr[finite_wr])
+    w_stable = np.zeros_like(log_wr, dtype=np.float64)
+    w_stable[finite_wr] = np.exp(log_wr[finite_wr] - lw_max)
+    Kw = K_np @ w_stable.astype(np.float32)
+    log_contrib = np.asarray(log_v, dtype=np.float64) + np.log(np.clip(Kw, 1e-300, None)) + lw_max
+    summary = _importance_weight_summary_from_log_weights(log_contrib)
+    finite_contrib = log_contrib[np.isfinite(log_contrib)]
+    if finite_contrib.size:
+        contrib = np.exp(finite_contrib - np.max(finite_contrib))
+        contrib = contrib[contrib > 0.0]
+    else:
+        contrib = np.array([], dtype=np.float64)
+    if contrib.size:
+        norm = np.sort(contrib / contrib.sum())[::-1]
+        n = norm.size
+        top_1 = norm[:max(1, int(np.ceil(0.01 * n)))].sum()
+        top_0p1 = norm[:max(1, int(np.ceil(0.001 * n)))].sum()
+    else:
+        top_1 = top_0p1 = np.nan
+    return dict(
+        hyperpoint=label,
+        found_injection_count=summary["n_total"],
+        cosmic_merger_count=int(K_np.shape[1]),
+        positive_contribution_count=int(contrib.size),
+        injection_ess=summary["ess"],
+        ess_fraction=summary["ess_fraction"],
+        max_contribution=summary["max_normalized_weight"],
+        top_1pct_alpha_fraction=float(top_1),
+        top_0p1pct_alpha_fraction=float(top_0p1),
+        warning=summary["warning"],
+    )
+
+
+def print_selection_weight_diagnostics(rows: list[dict]) -> None:
+    """Print selection-integral contribution diagnostics."""
+    if not rows:
+        return
+    print("\n Selection injection diagnostics:")
+    print(f"  {'hyperpoint':<18s} {'N_found':>8s} {'ESS':>10s} {'ESS/N':>8s} {'max':>10s} {'top1%':>8s} {'top0.1%':>8s} {'flag':>8s}")
+    print("  " + "-" * 94)
+    for row in rows:
+        print(f"  {row['hyperpoint']:<18.18s} "
+              f"{row['found_injection_count']:8d} "
+              f"{row['injection_ess']:10.1f} "
+              f"{row['ess_fraction']:8.4f} "
+              f"{row['max_contribution']:10.3e} "
+              f"{row['top_1pct_alpha_fraction']:8.3f} "
+              f"{row['top_0p1pct_alpha_fraction']:8.3f} "
+              f"{row['warning']:>8s}")
+
+
+def write_selection_weight_diagnostics_csv(path: str, rows: list[dict]) -> None:
+    import csv
+    fields = [
+        "hyperpoint", "found_injection_count", "cosmic_merger_count",
+        "positive_contribution_count", "injection_ess", "ess_fraction",
+        "max_contribution", "top_1pct_alpha_fraction",
+        "top_0p1pct_alpha_fraction", "warning",
+    ]
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
 def discover_events(results_root: str, config_name: str) -> list[str]:
     pattern = os.path.join(results_root, '*', config_name, 'log_z.npy')
     hits    = sorted(glob.glob(pattern))
@@ -1208,6 +1387,9 @@ def parse_args():
     p.add_argument("--target_accept", type=float, default=0.8,
                    help="NUTS target acceptance probability.")
     p.add_argument("--seed",          type=int,   default=42)
+    p.add_argument("--diagnostic_posterior_draws", type=int, default=5,
+                   help="Number of posterior draws, in addition to the posterior median, "
+                        "used for post-NUTS reweighting diagnostics.")
 
     sel = p.add_argument_group("Selection effects")
     sel.add_argument("--injections_path",   default=None)
@@ -1345,6 +1527,9 @@ def main():
     # ---- Selection effects ----
     log_alpha_fn = None
     cosmic_raw   = None   # made available for PPD plots below
+    cosmic       = None
+    K_np         = None
+    log_v        = None
     N_found_total = 0
     N_found_used = 0
     lvk_found_subsample_log_scale = 0.0
@@ -1509,6 +1694,32 @@ def main():
     print(f" Compilation done in {time.time()-t0:.1f}s. "
           f"Test log_L = {float(_):.3f}")
 
+    # Diagnostics at the default hyperparameter point before NUTS starts.  These
+    # are NumPy postprocessing calls and do not affect the JAX likelihood path.
+    reweighting_diagnostic_rows = compute_event_reweighting_diagnostics(
+        np.asarray(dummy_lp), "default_pre_nuts", log_wr_fns, event_names
+    )
+    print_event_reweighting_diagnostics(
+        reweighting_diagnostic_rows, "default_pre_nuts"
+    )
+    event_diag_path = os.path.join(out_dir, "event_reweighting_diagnostics.csv")
+    write_event_reweighting_diagnostics_csv(
+        event_diag_path, reweighting_diagnostic_rows
+    )
+    print(f"  Event reweighting diagnostics CSV: {event_diag_path}")
+
+    selection_diagnostic_rows = []
+    if selection_mode == "lvk_farr" and K_np is not None and cosmic is not None:
+        selection_diagnostic_rows.append(compute_selection_weight_diagnostics(
+            np.asarray(dummy_lp), "default_pre_nuts", K_np, log_v, cosmic
+        ))
+        print_selection_weight_diagnostics(selection_diagnostic_rows)
+        selection_diag_path = os.path.join(out_dir, "selection_weight_diagnostics.csv")
+        write_selection_weight_diagnostics_csv(
+            selection_diag_path, selection_diagnostic_rows
+        )
+        print(f"  Selection diagnostics CSV: {selection_diag_path}")
+
     model = make_numpyro_model(log_likelihood_fn)
 
     # ---- NUTS sampling ----
@@ -1563,11 +1774,51 @@ def main():
         np.array(samples_dict[k]).reshape(-1) for k in POP_PARAM_NAMES
     ])
 
+    posterior_median = np.median(flat_samples, axis=0)
+    median_rows = compute_event_reweighting_diagnostics(
+        posterior_median, "posterior_median", log_wr_fns, event_names
+    )
+    reweighting_diagnostic_rows.extend(median_rows)
+    print_event_reweighting_diagnostics(median_rows, "posterior_median")
+
+    n_diag_draws = max(0, min(int(opts.diagnostic_posterior_draws), len(flat_samples)))
+    if n_diag_draws:
+        rng_diag = np.random.default_rng(opts.seed + 30_001)
+        idx_diag = rng_diag.choice(len(flat_samples), n_diag_draws, replace=False)
+        for j, idx in enumerate(idx_diag):
+            label = f"posterior_draw_{j:03d}"
+            reweighting_diagnostic_rows.extend(
+                compute_event_reweighting_diagnostics(
+                    flat_samples[idx], label, log_wr_fns, event_names
+                )
+            )
+
+    if selection_mode == "lvk_farr" and K_np is not None and cosmic is not None:
+        selection_diagnostic_rows.append(compute_selection_weight_diagnostics(
+            posterior_median, "posterior_median", K_np, log_v, cosmic
+        ))
+        if n_diag_draws:
+            for j, idx in enumerate(idx_diag):
+                selection_diagnostic_rows.append(compute_selection_weight_diagnostics(
+                    flat_samples[idx], f"posterior_draw_{j:03d}", K_np, log_v, cosmic
+                ))
+        print_selection_weight_diagnostics(selection_diagnostic_rows)
+
     # ---- Save core outputs ----
     print(f"\n Saving to {out_dir}/...")
     samples_np = {k: np.array(v) for k, v in samples_dict.items()}
     np.savez(os.path.join(out_dir, "samples.npz"), **samples_np)
     np.save(os.path.join(out_dir, "points.npy"), flat_samples)
+
+    write_event_reweighting_diagnostics_csv(
+        event_diag_path, reweighting_diagnostic_rows
+    )
+    print(f"  Event reweighting diagnostics: {event_diag_path}")
+    if selection_diagnostic_rows:
+        write_selection_weight_diagnostics_csv(
+            selection_diag_path, selection_diagnostic_rows
+        )
+        print(f"  Selection diagnostics: {selection_diag_path}")
 
     import csv
     with open(os.path.join(out_dir, "summary.csv"), 'w', newline='') as f:
