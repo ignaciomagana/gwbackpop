@@ -17,7 +17,7 @@
 # Both 2D and 3D likelihood modes are run per event.
 #
 # Submit:
-#   sbatch run_catalog_gwtc3.slurm
+#   sbatch workflows/slurm/run_catalog_gwtc3.slurm
 #
 # Override PE samples directory:
 #   sbatch --export=ALL,PE_DIR=/path/to/samples run_catalog_gwtc3.slurm
@@ -206,7 +206,7 @@ echo " [1/3]  2D inference — lucky_strikes"
 echo "─────────────────────────────────────────────────────────────"
 T1=$(date +%s)
 
-python run_backpop.py \
+gwbackpop-run-event \
     --samples_path             "${SAMPLES}" \
     --event_name               "${EVENT}" \
     --config_name              lucky_strikes \
@@ -229,7 +229,7 @@ echo ">>> 2D done ($(elapsed ${T1}))"
 #echo "─────────────────────────────────────────────────────────────"
 #T2=$(date +%s)
 #
-#python run_backpop.py \
+#gwbackpop-run-event \
 #    --samples_path             "${SAMPLES}" \
 #    --event_name               "${EVENT}" \
 #    --config_name              lucky_strikes_zform \
@@ -252,7 +252,7 @@ echo " [3/3]  Plotting"
 echo "─────────────────────────────────────────────────────────────"
 T3=$(date +%s)
 
-python plot_backpop.py \
+gwbackpop-plot \
     --results_dir  "${RESULTS_ROOT}/${EVENT}/lucky_strikes" \
     --samples_path "${SAMPLES}" \
     --n_samples    5000 \

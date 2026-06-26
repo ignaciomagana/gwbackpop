@@ -45,7 +45,7 @@ RESULTS_ROOT="${RESULTS_ROOT:-./results}"
 CONFIG_NAME="lucky_strikes_zform"
 
 INJECTIONS_PATH="${INJECTIONS_PATH:-./injections/gwtc3_cosmic_mergers.npz}"
-# Build with: python run_injections.py --config_name lucky_strikes_zform --likelihood_mode 3D --output_path "$INJECTIONS_PATH" ...
+# Build with: gwbackpop-run-injections --config_name lucky_strikes_zform --likelihood_mode 3D --output_path "$INJECTIONS_PATH" ...
 # The 3D injection metadata must say likelihood_mode=3D, uses_z_form=True,
 # uses_sfr_prior=True, and uses_logZ_given_z_prior=True to match 3D events.
 INJECTION_CONFIG_NAME="${INJECTION_CONFIG_NAME:-lucky_strikes_zform}"
@@ -96,7 +96,7 @@ echo ""
 echo "Completed ${CONFIG_NAME} events found: ${N_EVENTS}"
 if [ "${N_EVENTS}" -lt 2 ]; then
     echo "ERROR: Need at least 2 completed ${CONFIG_NAME} events."
-    echo "Submit: sbatch run_catalog_gwtc3.slurm"
+    echo "Submit: sbatch workflows/slurm/run_catalog_gwtc3.slurm"
     exit 1
 fi
 
@@ -206,7 +206,7 @@ START=$(date +%s)
 # Run
 # ---------------------------------------------------------------------------
 
-python hierarchical_backpop_jax.py \
+gwbackpop-run-hierarchical \
     --results_root      "${RESULTS_ROOT}" \
     --config_name       "${CONFIG_NAME}" \
     --injections_path   "${INJECTIONS_PATH}" \

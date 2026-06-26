@@ -1,7 +1,7 @@
 import numpy as np
 
-import run_injections
-from backpop import get_backpop_config
+import gwbackpop.selection.injections as run_injections
+from gwbackpop.config import get_backpop_config
 
 
 class _FakePool:

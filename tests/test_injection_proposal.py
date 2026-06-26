@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from run_injections import LOWER, PARAMS, UPPER, compute_log_q_proposal
+from gwbackpop.selection.injections import LOWER, PARAMS, UPPER, compute_log_q_proposal
 
 
 def _theta(vk1=30.0, vk2=70.0):
@@ -30,7 +30,7 @@ def test_log_q_proposal_changes_with_kick_scale():
 
 
 def test_kick_direction_diagnostic_is_isotropic_in_cosmic_convention():
-    from run_injections import sample_kick_directions_for_diagnostic
+    from gwbackpop.selection.injections import sample_kick_directions_for_diagnostic
 
     rng = np.random.default_rng(12345)
     phi, theta = sample_kick_directions_for_diagnostic(rng, 50_000)
@@ -45,7 +45,7 @@ def test_kick_direction_diagnostic_is_isotropic_in_cosmic_convention():
 
 
 def test_isotropic_phi_logpdf_matches_sampler_distribution():
-    from run_injections import _isotropic_phi_logpdf
+    from gwbackpop.selection.injections import _isotropic_phi_logpdf
 
     assert np.isneginf(_isotropic_phi_logpdf(-91.0, -90.0, 90.0))
     assert np.isneginf(_isotropic_phi_logpdf(91.0, -90.0, 90.0))
@@ -53,7 +53,7 @@ def test_isotropic_phi_logpdf_matches_sampler_distribution():
 
 
 def test_injection_catalog_and_metadata_sidecar_do_not_overwrite(tmp_path):
-    from metadata_utils import save_metadata
+    from gwbackpop.metadata import save_metadata
 
     output_path = tmp_path / "tiny_injections.npz"
     metadata = {"likelihood_mode": "2D", "uses_aux_z_form": True}
@@ -76,8 +76,8 @@ def test_injection_catalog_and_metadata_sidecar_do_not_overwrite(tmp_path):
 
 
 def test_support_aware_logz_prior_normalizes_on_backpop_config():
-    from backpop_config import get_backpop_config
-    from cosmo_prior import log_prior_logZ_given_z_on_support
+    from gwbackpop.config import get_backpop_config
+    from gwbackpop.cosmology import log_prior_logZ_given_z_on_support
 
     lo, hi, params, _ = get_backpop_config("lucky_strikes_zform")
     zlo = float(lo[params.index("logZ")])
@@ -91,7 +91,7 @@ def test_support_aware_logz_prior_normalizes_on_backpop_config():
 
 
 def test_2d_aux_z_form_factor_cancels_when_added_to_static_numerator():
-    from run_injections import _log_q_z_form
+    from gwbackpop.selection.injections import _log_q_z_form
 
     z1, z2 = 0.5, 3.0
     log_q1 = _log_q_z_form(z1)
@@ -103,9 +103,9 @@ def test_2d_aux_z_form_factor_cancels_when_added_to_static_numerator():
 
 
 def test_3d_logz_proposal_and_static_numerator_use_same_config_support():
-    import run_injections as ri
-    from backpop_config import get_backpop_config
-    from cosmo_prior import log_prior_logZ_given_z_on_support
+    import gwbackpop.selection.injections as ri
+    from gwbackpop.config import get_backpop_config
+    from gwbackpop.cosmology import log_prior_logZ_given_z_on_support
 
     lo, hi, params, _ = get_backpop_config("lucky_strikes_zform")
     zlo = float(lo[params.index("logZ")])

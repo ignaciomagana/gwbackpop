@@ -28,6 +28,13 @@ test = ["pytest"]
 cosmic = ["cosmic-popsynth"]
 all = ["pytest", "cosmic-popsynth"]
 
+[project.scripts]
+gwbackpop-run-event = "gwbackpop.cli.run_backpop:main"
+gwbackpop-run-injections = "gwbackpop.cli.run_injections:main"
+gwbackpop-run-hierarchical = "gwbackpop.cli.run_hierarchical:main"
+gwbackpop-plot = "gwbackpop.cli.plot_backpop:main"
+gwbackpop-smoke-test = "gwbackpop.cli.smoke_test:main"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
@@ -35,14 +42,5 @@ markers = [
   "cosmic: tests that import or run COSMIC binary-evolution code",
 ]
 
-[tool.setuptools]
-py-modules = [
-  "backpop",
-  "backpop_config",
-  "cosmo_prior",
-  "hierarchical_backpop_jax",
-  "metadata_utils",
-  "plot_backpop",
-  "run_backpop",
-  "run_injections",
-]
+[tool.setuptools.packages.find]
+where = ["src"]

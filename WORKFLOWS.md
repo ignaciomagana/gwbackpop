@@ -26,7 +26,7 @@ For a fast smoke test of the hierarchical sampler only, call `hierarchical_backp
 Example:
 
 ```bash
-python hierarchical_backpop_jax.py \
+gwbackpop-run-hierarchical \
   --results_root ./results \
   --config_name lucky_strikes_zform \
   --output_dir ./results/hierarchical/lucky_strikes_zform/nuts/no_selection_smoke \

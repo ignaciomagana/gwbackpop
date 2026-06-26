@@ -6,7 +6,7 @@ import pytest
 
 def _load_determine_selection_mode():
     """Load only the pure helper so tests do not require JAX/NumPyro deps."""
-    source = Path(__file__).resolve().parents[1] / "hierarchical_backpop_jax.py"
+    source = Path(__file__).resolve().parents[1] / "src" / "gwbackpop" / "inference" / "hierarchical.py"
     module_ast = ast.parse(source.read_text())
     helper = next(
         node for node in module_ast.body
