@@ -9,7 +9,7 @@
 # Prerequisites:
 #   1. SLURM catalog runs finished:  results/*/lucky_strikes/log_z.npy exist
 #   2. COSMIC merger catalog built:  injections/gwtc3_cosmic_mergers.npz exists
-#                                    (run_injections.py without --pdet_path)
+#                                    (run_injections.py --config_name lucky_strikes without --pdet_path)
 #   3. LVK found injection file:     $LVK_FOUND_PATH exists
 #
 # Selection effects: Farr (2019) estimator using raw LVK found injections.
@@ -51,6 +51,8 @@ RESULTS_ROOT="${RESULTS_ROOT:-./results}"
 CONFIG_NAME="lucky_strikes"
 
 INJECTIONS_PATH="${INJECTIONS_PATH:-./injections/gwtc3_cosmic_mergers.npz}"
+# Build with: python run_injections.py --config_name lucky_strikes --output_path "$INJECTIONS_PATH" ...
+INJECTION_CONFIG_NAME="${INJECTION_CONFIG_NAME:-lucky_strikes}"
 LVK_FOUND_PATH="${LVK_FOUND_PATH:-./injections/endo3_bbhpop-LIGO-T2100113-v12.hdf5}"
 
 # NUTS sampler settings
