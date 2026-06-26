@@ -26,3 +26,26 @@ def test_log_q_proposal_changes_with_kick_scale():
     assert np.isfinite(log_q_50)
     assert np.isfinite(log_q_100)
     assert not np.isclose(log_q_50, log_q_100)
+
+
+def test_kick_direction_diagnostic_is_isotropic_in_cosmic_convention():
+    from run_injections import sample_kick_directions_for_diagnostic
+
+    rng = np.random.default_rng(12345)
+    phi, theta = sample_kick_directions_for_diagnostic(rng, 50_000)
+    sin_phi = np.sin(np.deg2rad(phi))
+
+    # For COSMIC's convention, phi is valid on [-90, 90] deg and theta is the
+    # [0, 360] deg azimuth.  Isotropy implies sin(phi) is uniform on [-1, 1].
+    assert abs(np.mean(sin_phi)) < 0.01
+    assert abs(np.var(sin_phi) - 1.0 / 3.0) < 0.01
+    assert abs(np.mean(theta) - 180.0) < 2.0
+    assert abs(np.var(theta) - 360.0**2 / 12.0) < 100.0
+
+
+def test_isotropic_phi_logpdf_matches_sampler_distribution():
+    from run_injections import _isotropic_phi_logpdf
+
+    assert np.isneginf(_isotropic_phi_logpdf(-91.0, -90.0, 90.0))
+    assert np.isneginf(_isotropic_phi_logpdf(91.0, -90.0, 90.0))
+    assert _isotropic_phi_logpdf(0.0, -90.0, 90.0) > _isotropic_phi_logpdf(60.0, -90.0, 90.0)
