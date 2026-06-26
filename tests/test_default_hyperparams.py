@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-hb = pytest.importorskip("hierarchical_backpop_jax")
+hb = pytest.importorskip("gwbackpop.inference.hierarchical")
 jnp = pytest.importorskip("jax.numpy")
 
 

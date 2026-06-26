@@ -2,19 +2,30 @@
 
 BackPop connects gravitational-wave parameter-estimation results to binary-population physics.  It uses COSMIC binary evolution as a forward model for isolated binary black-hole (BBH) formation, compares the resulting merger observables to event-level gravitational-wave posteriors, and then combines multiple single-event results in a hierarchical population analysis.
 
-The repository currently contains three main workflows:
+The repository currently contains three main workflows. The installed console commands are preferred; the old root-level Python wrappers remain temporarily available for backwards compatibility:
 
 | Workflow | Main entry point | Purpose | Status |
 |---|---|---|---|
-| Single-event 2D mass-only inference | `run_backpop.py` | Infer binary-evolution parameters for one GW event using a KDE likelihood in source-frame chirp mass and mass ratio, `(\mathcal{M}_c, q)`. | **Production-ready baseline**. This is the most mature single-event mode. |
-| Single-event 3D mass-redshift inference | `run_backpop.py --use_redshift_likelihood True` | Infer binary-evolution parameters for one GW event using `(\mathcal{M}_c, q, z_\mathrm{merger})` plus cosmological priors on formation redshift and metallicity. | **Production-ready if the PE samples and selection campaign are generated consistently**. Treat 2D/3D comparisons as model-dependent. |
-| Hierarchical population inference | `hierarchical_backpop_jax.py` | Reweight per-event BackPop posteriors under a population hypermodel and optionally apply selection corrections. | **Production-ready only for the LVK/Farr found-injection selection estimator or explicit no-selection diagnostics**. Direct `pdet` hierarchical selection is not implemented in the JAX driver. |
+| Single-event 2D mass-only inference | `gwbackpop-run-event` (`python run_backpop.py` wrapper) | Infer binary-evolution parameters for one GW event using a KDE likelihood in source-frame chirp mass and mass ratio, `(\mathcal{M}_c, q)`. | **Production-ready baseline**. This is the most mature single-event mode. |
+| Single-event 3D mass-redshift inference | `gwbackpop-run-event --use_redshift_likelihood True` (`python run_backpop.py` wrapper) | Infer binary-evolution parameters for one GW event using `(\mathcal{M}_c, q, z_\mathrm{merger})` plus cosmological priors on formation redshift and metallicity. | **Production-ready if the PE samples and selection campaign are generated consistently**. Treat 2D/3D comparisons as model-dependent. |
+| Hierarchical population inference | `gwbackpop-run-hierarchical` (`python hierarchical_backpop_jax.py` wrapper) | Reweight per-event BackPop posteriors under a population hypermodel and optionally apply selection corrections. | **Production-ready only for the LVK/Farr found-injection selection estimator or explicit no-selection diagnostics**. Direct `pdet` hierarchical selection is not implemented in the JAX driver. |
 
 Additional utilities:
 
-- `run_injections.py` builds COSMIC merger catalogs for selection corrections. It can either store a direct `P_det(m_1, m_2, z)` value from a pickled interpolator or store `pdet=nan` for the LVK/Farr workflow.
-- `plot_backpop.py` makes diagnostic figures from single-event output directories.
-- `run_hierarchical_2d.sh`, `run_hierarchical_3d.sh`, and `run_catalog_gwtc3.slurm` are convenience wrappers for catalog-scale analyses.
+- `gwbackpop-run-injections` (`python run_injections.py`) builds COSMIC merger catalogs for selection corrections. It can either store a direct `P_det(m_1, m_2, z)` value from a pickled interpolator or store `pdet=nan` for the LVK/Farr workflow.
+- `gwbackpop-plot` (`python plot_backpop.py`) makes diagnostic figures from single-event output directories.
+- `workflows/shell/run_hierarchical_2d.sh`, `workflows/shell/run_hierarchical_3d.sh`, and `workflows/slurm/run_catalog_gwtc3.slurm` are convenience wrappers for catalog-scale analyses.
+
+
+## Repository layout
+
+```text
+src/gwbackpop/       installable package
+scripts/             backwards-compatible wrappers
+workflows/           shell and SLURM workflow drivers
+tests/               lightweight tests
+experimental/        research prototypes not imported by production code
+```
 
 ## What BackPop does
 
@@ -25,7 +36,7 @@ BackPop samples **binary-evolution parameters** rather than just phenomenologica
 At a high level:
 
 1. **Single-event inference**: for each GW event, BackPop samples a base prior `\pi_0(\theta)`, evolves each proposed binary with COSMIC, and evaluates a likelihood against the PE posterior KDE. The output is an event-specific posterior over `\theta` and a single-event evidence `Z_i`.
-2. **COSMIC binary evolution**: `evolv2` in `backpop.py` maps ZAMS/binary-physics parameters to BBH merger masses and delay times. Non-mergers receive zero likelihood.
+2. **COSMIC binary evolution**: `evolv2` in `gwbackpop.evolution.cosmic` maps ZAMS/binary-physics parameters to BBH merger masses and delay times. Non-mergers receive zero likelihood.
 3. **2D mass-only likelihood**: the default single-event likelihood compares the COSMIC-predicted source-frame chirp mass and mass ratio to a KDE built from GW posterior samples.
 4. **3D mass-redshift likelihood**: the redshift mode also predicts `z_\mathrm{merger}` from `z_\mathrm{form}` and the COSMIC delay time, and evaluates a KDE in `(\mathcal{M}_c, q, z_\mathrm{merger})`.
 5. **Hierarchical population inference**: event posteriors are importance-reweighted from `\pi_0(\theta)` to a population density `p(\theta\mid\Lambda)`, where `\Lambda` are hyperparameters for common-envelope efficiency, accretion efficiency, and natal-kick distributions.
@@ -78,7 +89,7 @@ The 3D mode uses
 x_\mathrm{3D}(\theta) = \left(\mathcal{M}_{c,\mathrm{src}}(\theta), q_\mathrm{src}(\theta), z_\mathrm{merger}(\theta)\right).
 ```
 
-It adds `z_form` as a sampled parameter, draws or weights it with an SFR-weighted comoving-volume prior, and uses a metallicity model `p(\log Z\mid z_\mathrm{form})`. COSMIC supplies the delay time `t_\mathrm{delay}`; `z_\mathrm{merger}` is obtained by subtracting this delay from the formation lookback time using the Planck15 cosmology implemented in `cosmo_prior.py`.
+It adds `z_form` as a sampled parameter, draws or weights it with an SFR-weighted comoving-volume prior, and uses a metallicity model `p(\log Z\mid z_\mathrm{form})`. COSMIC supplies the delay time `t_\mathrm{delay}`; `z_\mathrm{merger}` is obtained by subtracting this delay from the formation lookback time using the Planck15 cosmology implemented in `gwbackpop.cosmology`.
 
 ### Hierarchical likelihood
 
@@ -123,7 +134,7 @@ BackPop has three relevant modes or estimators:
 
 ### 1. No selection correction (`none`)
 
-Run `hierarchical_backpop_jax.py` without `--injections_path` and without `--lvk_found_path`. This is fast and useful for smoke tests, convergence debugging, and demonstrating the reweighting machinery. It is **diagnostic only**: because detected GW events are not an unbiased draw from the astrophysical population, no-selection population posteriors should not be overinterpreted.
+Run `gwbackpop-run-hierarchical` without `--injections_path` and without `--lvk_found_path`. This is fast and useful for smoke tests, convergence debugging, and demonstrating the reweighting machinery. It is **diagnostic only**: because detected GW events are not an unbiased draw from the astrophysical population, no-selection population posteriors should not be overinterpreted.
 
 ### 2. Direct `pdet` estimator
 
@@ -211,7 +222,7 @@ The paths below are examples. Replace them with your PESummary files, pickled `P
 ### Single-event 2D run
 
 ```bash
-python run_backpop.py \
+gwbackpop-run-event \
   --samples_path /data/pe/GW150914_pesummary.h5 \
   --event_name GW150914 \
   --config_name lucky_strikes \
@@ -224,7 +235,7 @@ python run_backpop.py \
 ### Single-event 3D run
 
 ```bash
-python run_backpop.py \
+gwbackpop-run-event \
   --samples_path /data/pe/GW190814_pesummary.h5 \
   --event_name GW190814 \
   --config_name lucky_strikes_zform \
@@ -239,7 +250,7 @@ python run_backpop.py \
 For LVK/Farr production selection, omit `--pdet_path` so the catalog stores raw COSMIC mergers and lets the LVK found-injection estimator handle detectability:
 
 ```bash
-python run_injections.py \
+gwbackpop-run-injections \
   --config_name lucky_strikes_zform \
   --likelihood_mode 3D \
   --output_path injections/gwtc3_cosmic_mergers_3d.npz \
@@ -250,7 +261,7 @@ python run_injections.py \
 For a direct-`pdet` diagnostic campaign:
 
 ```bash
-python run_injections.py \
+gwbackpop-run-injections \
   --config_name lucky_strikes \
   --likelihood_mode 2D \
   --pdet_path /data/selection/pdet_interpolator.pkl \
@@ -264,7 +275,7 @@ python run_injections.py \
 This is a diagnostic run only:
 
 ```bash
-python hierarchical_backpop_jax.py \
+gwbackpop-run-hierarchical \
   --results_root results \
   --config_name lucky_strikes \
   --output_dir results/hierarchical/lucky_strikes/nuts/no_selection \
@@ -276,10 +287,10 @@ python hierarchical_backpop_jax.py \
 
 ### Hierarchical direct-`pdet` run
 
-Direct-`pdet` hierarchical selection is **not implemented in `hierarchical_backpop_jax.py`**. The following command is shown to document the intended input shape and current failure mode; in this repository version it raises `NotImplementedError` rather than silently running an uncorrected analysis:
+Direct-`pdet` hierarchical selection is **not implemented in `gwbackpop-run-hierarchical`**. The following command is shown to document the intended input shape and current failure mode; in this repository version it raises `NotImplementedError` rather than silently running an uncorrected analysis:
 
 ```bash
-python hierarchical_backpop_jax.py \
+gwbackpop-run-hierarchical \
   --results_root results \
   --config_name lucky_strikes \
   --injections_path injections/gwtc3_cosmic_mergers_with_pdet.npz \
@@ -291,7 +302,7 @@ Do not use the output of such a run for science unless you implement and validat
 ### Hierarchical LVK/Farr run
 
 ```bash
-python hierarchical_backpop_jax.py \
+gwbackpop-run-hierarchical \
   --results_root results \
   --config_name lucky_strikes_zform \
   --injections_path injections/gwtc3_cosmic_mergers_3d.npz \
@@ -320,7 +331,7 @@ python hierarchical_backpop_jax.py \
 
 ### Hierarchical output
 
-`hierarchical_backpop_jax.py` writes to the requested `--output_dir`:
+`gwbackpop-run-hierarchical` writes to the requested `--output_dir`:
 
 - `samples.npz`: per-chain NumPyro samples.
 - `points.npy`: flattened hyperparameter posterior samples.

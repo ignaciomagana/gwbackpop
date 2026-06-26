@@ -223,7 +223,7 @@ dtdz   = interp1d(_zgrid, np.gradient(13700 - _t_grid, _zgrid), bounds_error=Fal
 # Prior / config definitions
 # ---------------------------------------------------------------------------
 
-from backpop_config import get_backpop_config
+from gwbackpop.config import get_backpop_config
 
 
 # Human-readable labels for corner plots (LaTeX)

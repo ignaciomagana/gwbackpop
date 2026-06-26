@@ -298,7 +298,7 @@ def z_merger_from_t_delay(z_form: float, t_delay_myr: float) -> float | None:
     # BUG that was here: passing lookback time directly inverted the mapping,
     # returning z for the early universe (lookback=130 Myr → cosmic time
     # 130 Myr → z≈30) instead of the correct z (cosmic time 13570 Myr → z≈0.01).
-    from backpop import zoft
+    from gwbackpop.evolution.cosmic import zoft
     T_HUBBLE_MYR = 13700.0   # age of universe [Myr], matches backpop.py grid
     cosmic_time_merger = T_HUBBLE_MYR - t_lookback_merger
     z_merger = float(zoft(cosmic_time_merger))

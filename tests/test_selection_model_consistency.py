@@ -5,7 +5,7 @@ import pytest
 
 
 def _load_helpers():
-    source = Path(__file__).resolve().parents[1] / "hierarchical_backpop_jax.py"
+    source = Path(__file__).resolve().parents[1] / "src" / "gwbackpop" / "inference" / "hierarchical.py"
     module_ast = ast.parse(source.read_text())
     names = {"_bool_meta", "metadata_model_signature", "validate_selection_model_consistency"}
     helpers = [
