@@ -52,22 +52,65 @@ explicit HDI-based support truncation/penalization with ``--support_hdi``.
 from __future__ import annotations
 
 import os
+import sys
 import time
+import importlib
+import importlib.util
 import numpy as np
 from argparse import ArgumentParser
 from functools import partial
 
-from nautilus import Prior, Sampler
+from gwbackpop.config import get_backpop_config
 
-from gwbackpop.evolution.cosmic import (
-    get_backpop_config,
-    load_gw_data,
-    evolv2,
-    str_to_bool,
-    BPP_SHAPE,
-    KICK_SHAPE,
-    COLS_KEEP,
-)
+
+def _missing_optional_dependency(name: str):
+    raise ModuleNotFoundError(
+        f"Optional dependency {name!r} is required for this operation. "
+        "Install gwbackpop with the appropriate optional extras."
+    )
+
+
+if "nautilus" in sys.modules or importlib.util.find_spec("nautilus") is not None:
+    from nautilus import Prior, Sampler
+else:
+    class Prior:  # pragma: no cover - exercised only without optional dependency
+        def __init__(self, *args, **kwargs):
+            _missing_optional_dependency("nautilus")
+
+    class Sampler:  # pragma: no cover - exercised only without optional dependency
+        def __init__(self, *args, **kwargs):
+            _missing_optional_dependency("nautilus")
+
+
+def _load_cosmic_backend():
+    if importlib.util.find_spec("cosmic") is None:
+        _missing_optional_dependency("cosmic")
+    return importlib.import_module("gwbackpop.evolution.cosmic")
+
+
+def load_gw_data(*args, **kwargs):
+    return _load_cosmic_backend().load_gw_data(*args, **kwargs)
+
+
+def evolv2(*args, **kwargs):
+    return _load_cosmic_backend().evolv2(*args, **kwargs)
+
+
+def str_to_bool(value: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"true", "1", "yes", "y"}
+
+
+if importlib.util.find_spec("cosmic") is not None:
+    _cosmic_backend = _load_cosmic_backend()
+    COLS_KEEP = _cosmic_backend.COLS_KEEP
+    BPP_SHAPE = _cosmic_backend.BPP_SHAPE
+    KICK_SHAPE = _cosmic_backend.KICK_SHAPE
+else:
+    COLS_KEEP = ["kstar_1", "kstar_2", "evol_type", "tphys"]
+    BPP_SHAPE = (1,)
+    KICK_SHAPE = (1,)
 from gwbackpop.cosmology import (
     log_prior_z_form,
     log_prior_logZ_given_z_on_support,
