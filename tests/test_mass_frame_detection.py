@@ -6,7 +6,7 @@ import pytest
 
 
 def _load_mass_column_helpers():
-    source = Path(__file__).resolve().parents[1] / "backpop.py"
+    source = Path(__file__).resolve().parents[1] / "src" / "gwbackpop" / "evolution" / "cosmic.py"
     module_ast = ast.parse(source.read_text())
     wanted = {
         "_SOURCE_MASS_ALIASES",

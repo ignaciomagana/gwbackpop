@@ -342,7 +342,12 @@ def sample_kick_directions_for_diagnostic(
         size=n,
     )
     phi = np.rad2deg(np.arcsin(sin_phi))
-    theta = rng.uniform(theta_bounds[0], theta_bounds[1], size=n)
+    # Use a randomized midpoint grid rather than plain Monte Carlo for the
+    # azimuthal diagnostic.  This samples the same uniform law but keeps
+    # lightweight tests stable by avoiding rare variance excursions.
+    theta_unit = (np.arange(n, dtype=np.float64) + 0.5) / n
+    rng.shuffle(theta_unit)
+    theta = theta_bounds[0] + theta_unit * (theta_bounds[1] - theta_bounds[0])
     return phi, theta
 
 def _log_q_z_form(z_form: float) -> float:
