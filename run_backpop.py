@@ -1,6 +1,11 @@
 #!/usr/bin/env python
 """Compatibility wrapper. Prefer ``gwbackpop-run-event``."""
 import sys
+from pathlib import Path
+
+_SRC = Path(__file__).resolve().parent / "src"
+if _SRC.exists():
+    sys.path.insert(0, str(_SRC))
 
 from gwbackpop.inference import single_event as _single_event
 
