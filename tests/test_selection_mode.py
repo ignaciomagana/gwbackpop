@@ -35,6 +35,5 @@ def test_lvk_found_path_requires_injections_path():
         determine_selection_mode(None, "lvk.hdf5")
 
 
-def test_cosmic_only_interpolator_mode_hard_errors():
-    with pytest.raises(NotImplementedError, match="unimplemented interpolator"):
-        determine_selection_mode("cosmic.npz", None)
+def test_cosmic_only_selects_direct_pdet():
+    assert determine_selection_mode("cosmic.npz", None) == "direct_pdet"

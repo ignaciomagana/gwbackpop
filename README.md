@@ -8,7 +8,7 @@ The repository currently contains three main workflows. The installed console co
 |---|---|---|---|
 | Single-event 2D mass-only inference | `gwbackpop-run-event` | Infer binary-evolution parameters for one GW event using a KDE likelihood in source-frame chirp mass and mass ratio, `(\mathcal{M}_c, q)`. | **Production-ready baseline**. This is the most mature single-event mode. |
 | Single-event 3D mass-redshift inference | `gwbackpop-run-event --use_redshift_likelihood True` | Infer binary-evolution parameters for one GW event using `(\mathcal{M}_c, q, z_\mathrm{merger})` plus cosmological priors on formation redshift and metallicity. | **Production-ready if the PE samples and selection campaign are generated consistently**. Treat 2D/3D comparisons as model-dependent. |
-| Hierarchical population inference | `gwbackpop-run-hierarchical` | Reweight per-event BackPop posteriors under a population hypermodel and optionally apply selection corrections. | **Production-ready only for the LVK/Farr found-injection selection estimator or explicit no-selection diagnostics**. Direct `pdet` hierarchical selection is not implemented in the JAX driver. |
+| Hierarchical population inference | `gwbackpop-run-hierarchical` | Reweight per-event BackPop posteriors under a population hypermodel and optionally apply selection corrections. | **Production-ready for the LVK/Farr found-injection estimator, direct `pdet` estimator with validated injection catalogs, or explicit no-selection diagnostics**. |
 
 Additional utilities:
 
@@ -139,9 +139,29 @@ Run `gwbackpop-run-hierarchical` without `--injections_path` and without `--lvk_
 
 `gwbackpop-run-injections --pdet_path /path/to/pdet_interpolator.pkl` evaluates a user-provided callable `P_det(m1_src, m2_src, z_merger)` for each COSMIC merger and stores the result in the injection `.npz`. This is useful for building and auditing direct detection-probability campaigns.
 
-However, the current JAX hierarchical driver intentionally hard-errors if `--injections_path` is provided without `--lvk_found_path`, because the old direct-interpolator hierarchical path is not implemented there. Treat direct-`pdet` hierarchical selection as **not production-ready in this repository version** unless you add and validate that estimator yourself.
+The JAX hierarchical driver now treats `--injections_path` without `--lvk_found_path` as `selection_mode="direct_pdet"`, provided the catalog contains finite `pdet` values. Build the catalog with:
 
-The direct estimator would have the schematic Monte Carlo form
+```bash
+gwbackpop-run-injections \
+  --config_name lucky_strikes \
+  --likelihood_mode 2D \
+  --pdet_path /path/to/pdet_interpolator.pkl \
+  --output_path injections/gwtc3_cosmic_mergers_with_pdet.npz \
+  --n_inj 1000000 \
+  --n_workers 64
+```
+
+Then run hierarchical selection with:
+
+```bash
+gwbackpop-run-hierarchical \
+  --results_root results \
+  --config_name lucky_strikes \
+  --injections_path injections/gwtc3_cosmic_mergers_with_pdet.npz \
+  --output_dir results/hierarchical/lucky_strikes/nuts/direct_pdet
+```
+
+The direct estimator has the schematic Monte Carlo form
 
 ```math
 \alpha(\Lambda)
@@ -286,17 +306,17 @@ gwbackpop-run-hierarchical \
 
 ### Hierarchical direct-`pdet` run
 
-Direct-`pdet` hierarchical selection is **not implemented in `gwbackpop-run-hierarchical`**. The following command is shown to document the intended input shape and current failure mode; in this repository version it raises `NotImplementedError` rather than silently running an uncorrected analysis:
+Direct-`pdet` hierarchical selection is implemented in `gwbackpop-run-hierarchical` when an injection catalog with finite `pdet` is provided and `--lvk_found_path` is omitted:
 
 ```bash
 gwbackpop-run-hierarchical \
   --results_root results \
   --config_name lucky_strikes \
   --injections_path injections/gwtc3_cosmic_mergers_with_pdet.npz \
-  --output_dir results/hierarchical/lucky_strikes/nuts/direct_pdet_DIAGNOSTIC_ONLY
+  --output_dir results/hierarchical/lucky_strikes/nuts/direct_pdet
 ```
 
-Do not use the output of such a run for science unless you implement and validate the direct `pdet` `\alpha(\Lambda)` estimator.
+This mode uses the `pdet` stored in the COSMIC merger catalog and normalizes `\alpha(\Lambda)` by `N_inj`, the total number of proposed COSMIC draws, not `N_merge`, the number of stored mergers. If `pdet` is `nan`, either provide `--lvk_found_path` for LVK/Farr mode or rebuild the catalog with `--pdet_path`. 2D events need 2D injection metadata; 3D events need 3D injection metadata.
 
 ### Hierarchical LVK/Farr run
 
@@ -362,7 +382,7 @@ BackPop uses finite prior bounds for several event and injection parameters and 
 
 ### Diagnostic modes are not science results
 
-No-selection hierarchical runs, direct-`pdet` hierarchical attempts in the current JAX driver, small injection campaigns, heavily subsampled LVK found-injection matrices, and intentionally inconsistent 2D/3D combinations are diagnostics. They can be valuable for debugging but should not be presented as final astrophysical population constraints.
+No-selection hierarchical runs, direct-`pdet` runs with invalid or inconsistent pdet catalogs, small injection campaigns, heavily subsampled LVK found-injection matrices, and intentionally inconsistent 2D/3D combinations are diagnostics. They can be valuable for debugging but should not be presented as final astrophysical population constraints.
 
 ## Environment setup and lightweight tests
 
