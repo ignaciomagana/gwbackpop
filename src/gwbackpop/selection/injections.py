@@ -118,7 +118,7 @@ ZFORM_MAX = 20.0
 # Worker function (runs in subprocess — must be importable at module level)
 # ---------------------------------------------------------------------------
 
-def _worker_init(pdet_path: str | None, config_name: str = DEFAULT_CONFIG_NAME, likelihood_mode: str = "2D") -> None:
+def _worker_init(pdet_path: str | None, config_name: str = DEFAULT_CONFIG_NAME, likelihood_mode: str = "2D", pdet_callable=None) -> None:
     """Load P_det interpolator once per worker process.
     If pdet_path is None, P_det evaluation is skipped and pdet=nan is stored.
     Use this mode when building the COSMIC merger catalog for LVKInjectionCampaign.
@@ -126,6 +126,9 @@ def _worker_init(pdet_path: str | None, config_name: str = DEFAULT_CONFIG_NAME, 
     global _PDET, LOWER, UPPER, PARAMS, FIXED_PARAMS, LIKELIHOOD_MODE
     LOWER, UPPER, PARAMS, FIXED_PARAMS = _load_config(config_name)
     LIKELIHOOD_MODE = str(likelihood_mode).upper()
+    if pdet_callable is not None:
+        _PDET = pdet_callable
+        return
     if pdet_path is None:
         _PDET = None
         return
@@ -434,6 +437,56 @@ def _draw_logZ_given_z(rng: np.random.Generator, z_form: float,
 # Campaign runner
 # ---------------------------------------------------------------------------
 
+def resolve_pdet_callable(
+    pdet_mode: str = "auto",
+    pdet_path: str | None = None,
+    *,
+    snr_pdet_method: str = "orientation_monte_carlo",
+    snr_threshold: float = 10.0,
+    snr_ref: float = 20.0,
+    snr_mc_ref: float = 26.1,
+    snr_d_ref_mpc: float = 1000.0,
+    snr_sensitivity_scale: float = 1.0,
+    snr_logistic_width: float = 1.0,
+    snr_orientation_seed: int = 1234,
+    snr_n_orientation: int = 200000,
+):
+    """Resolve injection pdet mode into a callable/path plus metadata."""
+    mode = str(pdet_mode).lower()
+    if mode == "auto":
+        mode = "pickle" if pdet_path else "none"
+    if mode not in {"none", "pickle", "snr_proxy"}:
+        raise ValueError("pdet_mode must be one of auto, none, pickle, snr_proxy")
+    metadata = {"pdet_mode": mode}
+    if mode == "none":
+        return None, None, metadata
+    if mode == "pickle":
+        if not pdet_path:
+            raise ValueError("pdet_mode='pickle' requires --pdet_path")
+        return pdet_path, None, metadata
+    if pdet_path:
+        warnings.warn("pdet_mode='snr_proxy' ignores --pdet_path", RuntimeWarning)
+    from gwbackpop.selection.snr_pdet import make_snr_proxy_pdet_callable
+    callable_ = make_snr_proxy_pdet_callable(
+        method=snr_pdet_method, rho_threshold=snr_threshold, rho_ref=snr_ref,
+        mc_ref=snr_mc_ref, d_ref_mpc=snr_d_ref_mpc,
+        sensitivity_scale=snr_sensitivity_scale, logistic_width=snr_logistic_width,
+        seed=snr_orientation_seed, n_orientation=snr_n_orientation,
+    )
+    metadata.update(
+        pdet_model_name="semi_analytic_snr_proxy",
+        snr_pdet_method=snr_pdet_method, snr_threshold=float(snr_threshold),
+        snr_ref=float(snr_ref), snr_mc_ref=float(snr_mc_ref),
+        snr_d_ref_mpc=float(snr_d_ref_mpc),
+        snr_sensitivity_scale=float(snr_sensitivity_scale),
+        snr_logistic_width=float(snr_logistic_width),
+        snr_orientation_seed=int(snr_orientation_seed),
+        snr_n_orientation=int(snr_n_orientation),
+        pdet_is_diagnostic=True, pdet_production_ready=False,
+    )
+    return None, callable_, metadata
+
+
 def run_campaign(
     pdet_path: str | None,
     output_path: str,
@@ -442,6 +495,16 @@ def run_campaign(
     chunk_size: int = 500,
     config_name: str | None = None,
     likelihood_mode: str = "2D",
+    pdet_mode: str = "auto",
+    snr_pdet_method: str = "orientation_monte_carlo",
+    snr_threshold: float = 10.0,
+    snr_ref: float = 20.0,
+    snr_mc_ref: float = 26.1,
+    snr_d_ref_mpc: float = 1000.0,
+    snr_sensitivity_scale: float = 1.0,
+    snr_logistic_width: float = 1.0,
+    snr_orientation_seed: int = 1234,
+    snr_n_orientation: int = 200000,
 ) -> None:
     """Run the full injection campaign and save results.
 
@@ -466,6 +529,13 @@ def run_campaign(
         raise ValueError("likelihood_mode must be 2D or 3D")
 
     os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+    pdet_path_resolved, pdet_callable, pdet_metadata = resolve_pdet_callable(
+        pdet_mode, pdet_path, snr_pdet_method=snr_pdet_method,
+        snr_threshold=snr_threshold, snr_ref=snr_ref, snr_mc_ref=snr_mc_ref,
+        snr_d_ref_mpc=snr_d_ref_mpc, snr_sensitivity_scale=snr_sensitivity_scale,
+        snr_logistic_width=snr_logistic_width, snr_orientation_seed=snr_orientation_seed,
+        snr_n_orientation=snr_n_orientation,
+    )
     start = time.time()
 
     # Seeds: deterministic, reproducible, one per injection
@@ -480,14 +550,15 @@ def run_campaign(
         "truncated Maxwellian kick speeds and isotropic COSMIC kick directions; "
         "do not combine its log_q_proposal with older proposal versions."
     )
-    print(f"[injections] pdet: {pdet_path}")
+    print(f"[injections] pdet_mode: {pdet_metadata['pdet_mode']}")
+    print(f"[injections] pdet: {pdet_path_resolved}")
     print(f"[injections] output: {output_path}")
     print()
 
     with Pool(
         processes=n_workers,
         initializer=_worker_init,
-        initargs=(pdet_path, config_name, LIKELIHOOD_MODE),
+        initargs=(pdet_path_resolved, config_name, LIKELIHOOD_MODE, pdet_callable),
     ) as pool:
         for i in range(0, n_inj, chunk_size):
             batch = seeds[i : i + chunk_size]
@@ -572,7 +643,8 @@ def run_campaign(
         uses_logZ_given_z_prior=bool(LIKELIHOOD_MODE == "3D"),
         logZ_support=[float(LOGZ_LO), float(LOGZ_HI)],
         coordinate_system=COORDINATE_SYSTEM,
-        pdet_path=pdet_path,
+        pdet_path=pdet_path_resolved,
+        **pdet_metadata,
         n_workers=int(n_workers),
         chunk_size=int(chunk_size),
         wall_time_s=float(elapsed),
@@ -610,6 +682,19 @@ def run_campaign(
         uses_sfr_prior        = np.array([LIKELIHOOD_MODE == "3D"]),
         uses_logZ_given_z_prior = np.array([LIKELIHOOD_MODE == "3D"]),
         wall_time_s          = np.array([elapsed]),
+        pdet_mode           = np.array([pdet_metadata["pdet_mode"]]),
+        pdet_model_name      = np.array([pdet_metadata.get("pdet_model_name", "")]),
+        snr_pdet_method      = np.array([pdet_metadata.get("snr_pdet_method", "")]),
+        snr_threshold        = np.array([pdet_metadata.get("snr_threshold", np.nan)]),
+        snr_ref              = np.array([pdet_metadata.get("snr_ref", np.nan)]),
+        snr_mc_ref           = np.array([pdet_metadata.get("snr_mc_ref", np.nan)]),
+        snr_d_ref_mpc        = np.array([pdet_metadata.get("snr_d_ref_mpc", np.nan)]),
+        snr_sensitivity_scale = np.array([pdet_metadata.get("snr_sensitivity_scale", np.nan)]),
+        snr_logistic_width   = np.array([pdet_metadata.get("snr_logistic_width", np.nan)]),
+        snr_orientation_seed = np.array([pdet_metadata.get("snr_orientation_seed", -1)]),
+        snr_n_orientation    = np.array([pdet_metadata.get("snr_n_orientation", -1)]),
+        pdet_is_diagnostic   = np.array([pdet_metadata.get("pdet_is_diagnostic", False)]),
+        pdet_production_ready = np.array([pdet_metadata.get("pdet_production_ready", pdet_metadata["pdet_mode"] == "pickle")]),
         metadata             = np.array(metadata, dtype=object),
     )
     catalog_path = os.fspath(output_path)
@@ -626,10 +711,18 @@ def run_campaign(
 def parse_args():
     p = ArgumentParser(description="BackPop injection campaign for selection effects.")
     p.add_argument("--pdet_path",   default=None,
-                   help="Path to pickled P_det(m1_src, m2_src, z) interpolator. "
-                        "If omitted, pdet values are not computed and stored as nan. "
-                        "Use this when building the COSMIC merger catalog for "
-                        "LVKInjectionCampaign (raw found-injection Farr estimator).")
+                   help="Path to pickled P_det(m1_src, m2_src, z) interpolator.")
+    p.add_argument("--pdet_mode", choices=["auto", "none", "pickle", "snr_proxy"], default="auto",
+                   help="P_det source: auto uses pickle when --pdet_path is set, else none; snr_proxy is diagnostic only.")
+    p.add_argument("--snr_pdet_method", choices=["hard_threshold", "orientation_monte_carlo", "logistic"], default="orientation_monte_carlo")
+    p.add_argument("--snr_threshold", type=float, default=10.0)
+    p.add_argument("--snr_ref", type=float, default=20.0)
+    p.add_argument("--snr_mc_ref", type=float, default=26.1)
+    p.add_argument("--snr_d_ref_mpc", type=float, default=1000.0)
+    p.add_argument("--snr_sensitivity_scale", type=float, default=1.0)
+    p.add_argument("--snr_logistic_width", type=float, default=1.0)
+    p.add_argument("--snr_orientation_seed", type=int, default=1234)
+    p.add_argument("--snr_n_orientation", type=int, default=200000)
     p.add_argument("--output_path", required=True,
                    help="Output NPZ file path.")
     p.add_argument("--n_inj",       type=int, default=1_000_000,
@@ -664,6 +757,16 @@ def main():
         chunk_size  = opts.chunk_size,
         config_name  = opts.config_name,
         likelihood_mode = opts.likelihood_mode,
+        pdet_mode = opts.pdet_mode,
+        snr_pdet_method = opts.snr_pdet_method,
+        snr_threshold = opts.snr_threshold,
+        snr_ref = opts.snr_ref,
+        snr_mc_ref = opts.snr_mc_ref,
+        snr_d_ref_mpc = opts.snr_d_ref_mpc,
+        snr_sensitivity_scale = opts.snr_sensitivity_scale,
+        snr_logistic_width = opts.snr_logistic_width,
+        snr_orientation_seed = opts.snr_orientation_seed,
+        snr_n_orientation = opts.snr_n_orientation,
     )
 
 

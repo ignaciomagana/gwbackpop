@@ -1541,6 +1541,62 @@ def determine_selection_mode(injections_path: str | None, lvk_found_path: str | 
 
 
 
+def _compute_log_pop_static_for_catalog(cosmic_raw, injection_model_metadata: dict, log_q_arr: np.ndarray | None) -> np.ndarray | None:
+    """Population numerator factors not varied by hierarchical hyperparameters."""
+    if log_q_arr is None:
+        return None
+    from gwbackpop.cosmology import log_prior_z_form, log_prior_logZ_given_z_on_support
+
+    theta = cosmic_raw['theta'].astype(np.float64)
+    params = list(cosmic_raw['params'])
+    lo = cosmic_raw['lower_bound'].astype(np.float64)
+    hi = cosmic_raw['upper_bound'].astype(np.float64)
+    pidx = {p: i for i, p in enumerate(params)}
+    varied = {'alpha_1', 'alpha_2', 'flim_1', 'flim_2', 'vk1', 'vk2'}
+    sig = metadata_model_signature(injection_model_metadata)
+    uses_aux_z_form = _bool_meta(injection_model_metadata.get("uses_aux_z_form"), False)
+    log_pop_static = np.zeros(theta.shape[0], dtype=np.float64)
+
+    for name in params:
+        if name in varied:
+            continue
+        if name == "z_form" and (sig["uses_sfr_prior"] or uses_aux_z_form):
+            continue
+        if name == "logZ" and sig["uses_logZ_given_z_prior"]:
+            continue
+        idx = pidx[name]
+        width = hi[idx] - lo[idx]
+        if not width > 0.0:
+            raise ValueError(f"Invalid injection bounds for {name}: [{lo[idx]}, {hi[idx]}]")
+        log_pop_static += -np.log(width)
+
+    if (sig['uses_z_form'] or sig['uses_sfr_prior'] or sig['uses_logZ_given_z_prior'] or uses_aux_z_form):
+        if 'z_form' in cosmic_raw:
+            zf = cosmic_raw['z_form'].astype(np.float64)
+            if sig['uses_sfr_prior'] or uses_aux_z_form:
+                log_pop_static += np.array([log_prior_z_form(z) for z in zf], dtype=np.float64)
+            if sig['uses_logZ_given_z_prior']:
+                if 'logZ' not in cosmic_raw:
+                    raise ValueError("Injection metadata requires logZ prior but catalog lacks logZ")
+                lz = cosmic_raw['logZ'].astype(np.float64)
+                logz_idx = pidx.get("logZ")
+                default_support = injection_model_metadata.get("logZ_support", [-np.inf, np.inf])
+                logz_lo = float(lo[logz_idx]) if logz_idx is not None else float(default_support[0])
+                logz_hi = float(hi[logz_idx]) if logz_idx is not None else float(default_support[1])
+                log_pop_static += np.array([
+                    log_prior_logZ_given_z_on_support(zmet, z, logz_lo, logz_hi)
+                    for zmet, z in zip(lz, zf)
+                ], dtype=np.float64)
+        else:
+            warnings.warn(
+                "Injection file has log_q_proposal but lacks z_form; assuming cosmological proposal factors cancel.",
+                RuntimeWarning,
+            )
+    if not np.all(np.isfinite(log_pop_static)):
+        raise ValueError("Computed log_pop_static contains non-finite values")
+    return log_pop_static
+
+
 def load_cosmic_merger_catalog_for_selection(injections_path: str, event_model_metadata: list[dict], allow_inconsistent_selection_model: bool) -> tuple[dict, dict, bool, str]:
     """Load COSMIC merger injection NPZ and shared proposal/static-pop accounting."""
     cosmic_raw = np.load(injections_path, allow_pickle=True)
@@ -1555,8 +1611,19 @@ def load_cosmic_merger_catalog_for_selection(injections_path: str, event_model_m
     })
     selection_model_consistent, selection_model_consistency_message = validate_selection_model_consistency(event_model_metadata, injection_model_metadata, allow_inconsistent_selection_model)
     log_q_arr = cosmic_raw['log_q_proposal'].astype(np.float64) if 'log_q_proposal' in cosmic_raw else None
-    if log_q_arr is not None and not np.all(np.isfinite(log_q_arr)): raise ValueError("log_q_proposal contains non-finite values")
-    log_pop_static_arr = np.zeros(cosmic_raw['theta'].shape[0], dtype=np.float64) if log_q_arr is not None else None
+    if log_q_arr is not None:
+        if log_q_arr.shape[0] != cosmic_raw['theta'].shape[0]:
+            raise ValueError("log_q_proposal length must match theta")
+        if not np.all(np.isfinite(log_q_arr)):
+            raise ValueError("log_q_proposal contains non-finite values")
+        log_pop_static_arr = _compute_log_pop_static_for_catalog(cosmic_raw, injection_model_metadata, log_q_arr)
+        print("  Using explicit log_q_proposal from COSMIC merger catalog")
+    else:
+        warnings.warn(
+            "Injection file lacks log_q_proposal; falling back to legacy proposal reconstruction from bounds and kick_proposal_sigma.",
+            RuntimeWarning,
+        )
+        log_pop_static_arr = None
     cosmic = dict(theta=cosmic_raw['theta'].astype(np.float64), m1_src=cosmic_raw['m1_src'].astype(np.float64) if 'm1_src' in cosmic_raw else np.array([]), m2_src=cosmic_raw['m2_src'].astype(np.float64) if 'm2_src' in cosmic_raw else np.array([]), z_merger=cosmic_raw['z_merger'].astype(np.float64) if 'z_merger' in cosmic_raw else np.array([]), pdet=cosmic_raw['pdet'].astype(np.float64) if 'pdet' in cosmic_raw else None, params=list(cosmic_raw['params']), lo=cosmic_raw['lower_bound'].astype(np.float64), hi=cosmic_raw['upper_bound'].astype(np.float64), N_inj=int(cosmic_raw['N_inj'].ravel()[0]), N_merge=int(cosmic_raw['N_merge'].ravel()[0]), kick_sigma=float(cosmic_raw['kick_proposal_sigma'].ravel()[0] if 'kick_proposal_sigma' in cosmic_raw else 50.0), log_q_proposal=log_q_arr, log_pop_static=log_pop_static_arr)
     return cosmic, injection_model_metadata, selection_model_consistent, selection_model_consistency_message
 
@@ -1706,81 +1773,13 @@ def main():
             print(f"  Subsampled N_found: {N_found_total:,} -> {N_found_used:,}")
 
         print(f"\n Loading COSMIC merger catalog: {opts.injections_path}")
+        cosmic, injection_model_metadata, selection_model_consistent, selection_model_consistency_message = load_cosmic_merger_catalog_for_selection(
+            opts.injections_path,
+            event_model_metadata,
+            opts.allow_inconsistent_selection_model,
+        )
         cosmic_raw = np.load(opts.injections_path, allow_pickle=True)
-        if "metadata" in cosmic_raw:
-            injection_model_metadata = dict(cosmic_raw["metadata"].item())
-        else:
-            injection_model_metadata = {}
-        injection_model_metadata.update({
-            "likelihood_mode": _npz_scalar(cosmic_raw, "likelihood_mode", injection_model_metadata.get("likelihood_mode", "3D" if "z_form" in cosmic_raw else "2D")),
-            "uses_z_form": _npz_scalar(cosmic_raw, "uses_z_form", injection_model_metadata.get("uses_z_form", "z_form" in cosmic_raw)),
-            "uses_aux_z_form": _npz_scalar(cosmic_raw, "uses_aux_z_form", injection_model_metadata.get("uses_aux_z_form", False)),
-            "uses_sfr_prior": _npz_scalar(cosmic_raw, "uses_sfr_prior", injection_model_metadata.get("uses_sfr_prior", "z_form" in cosmic_raw)),
-            "uses_logZ_given_z_prior": _npz_scalar(cosmic_raw, "uses_logZ_given_z_prior", injection_model_metadata.get("uses_logZ_given_z_prior", "z_form" in cosmic_raw and "logZ" in cosmic_raw)),
-            "proposal_version": _npz_scalar(cosmic_raw, "proposal_version", injection_model_metadata.get("proposal_version", "unknown")),
-        })
-        selection_model_consistent, selection_model_consistency_message = validate_selection_model_consistency(
-            event_model_metadata, injection_model_metadata, opts.allow_inconsistent_selection_model
-        )
         print(f"  Selection model consistency: {selection_model_consistency_message}")
-        log_q_arr = None
-        log_pop_static_arr = None
-        if 'log_q_proposal' in cosmic_raw:
-            log_q_arr = cosmic_raw['log_q_proposal'].astype(np.float64)
-            if not np.all(np.isfinite(log_q_arr)):
-                raise ValueError("log_q_proposal contains non-finite values")
-            from gwbackpop.cosmology import log_prior_z_form, log_prior_logZ_given_z_on_support
-            theta_tmp = cosmic_raw['theta'].astype(np.float64)
-            params_tmp = list(cosmic_raw['params'])
-            lo_tmp = cosmic_raw['lower_bound'].astype(np.float64)
-            hi_tmp = cosmic_raw['upper_bound'].astype(np.float64)
-            pidx_tmp = {p: i for i, p in enumerate(params_tmp)}
-            log_pop_static_arr = np.zeros(theta_tmp.shape[0], dtype=np.float64)
-            inj_sig_for_weights = metadata_model_signature(injection_model_metadata)
-            for name in params_tmp:
-                if name == "z_form" and inj_sig_for_weights["uses_sfr_prior"]:
-                    continue
-                if name == "logZ" and inj_sig_for_weights["uses_logZ_given_z_prior"]:
-                    continue
-                if name not in ('alpha_1', 'alpha_2', 'flim_1', 'flim_2', 'vk1', 'vk2'):
-                    idx = pidx_tmp[name]
-                    log_pop_static_arr += -np.log(hi_tmp[idx] - lo_tmp[idx])
-            uses_aux_z_form = _bool_meta(injection_model_metadata.get("uses_aux_z_form"), False)
-            if (inj_sig_for_weights['uses_z_form'] or inj_sig_for_weights['uses_sfr_prior'] or inj_sig_for_weights['uses_logZ_given_z_prior'] or uses_aux_z_form) and 'z_form' in cosmic_raw and 'logZ' in cosmic_raw:
-                zf = cosmic_raw['z_form'].astype(np.float64)
-                lz = cosmic_raw['logZ'].astype(np.float64)
-                if inj_sig_for_weights['uses_sfr_prior'] or uses_aux_z_form:
-                    log_pop_static_arr += np.array([log_prior_z_form(z) for z in zf])
-                if inj_sig_for_weights['uses_logZ_given_z_prior']:
-                    logz_idx = pidx_tmp.get("logZ")
-                    logz_lo = float(lo_tmp[logz_idx]) if logz_idx is not None else float(injection_model_metadata.get("logZ_support", [-np.inf, np.inf])[0])
-                    logz_hi = float(hi_tmp[logz_idx]) if logz_idx is not None else float(injection_model_metadata.get("logZ_support", [-np.inf, np.inf])[1])
-                    log_pop_static_arr += np.array([log_prior_logZ_given_z_on_support(zmet, z, logz_lo, logz_hi) for zmet, z in zip(lz, zf)])
-            else:
-                warnings.warn(
-                    "Injection file has log_q_proposal but lacks z_form/logZ; "
-                    "assuming cosmological proposal factors cancel.",
-                    RuntimeWarning,
-                )
-            print("  Using explicit log_q_proposal from COSMIC merger catalog")
-
-        cosmic = dict(
-            theta    = cosmic_raw['theta'].astype(np.float64),
-            m1_src   = cosmic_raw['m1_src'].astype(np.float64),
-            m2_src   = cosmic_raw['m2_src'].astype(np.float64),
-            z_merger = cosmic_raw['z_merger'].astype(np.float64),
-            params   = list(cosmic_raw['params']),
-            lo       = cosmic_raw['lower_bound'].astype(np.float64),
-            hi       = cosmic_raw['upper_bound'].astype(np.float64),
-            N_inj    = int(cosmic_raw['N_inj'].ravel()[0]),
-            N_merge  = int(cosmic_raw['N_merge'].ravel()[0]),
-            kick_sigma = float(
-                cosmic_raw['kick_proposal_sigma'].ravel()[0]
-                if 'kick_proposal_sigma' in cosmic_raw else 50.0
-            ),
-            log_q_proposal = log_q_arr,
-            log_pop_static = log_pop_static_arr,
-        )
         print(f"  N_merge={cosmic['N_merge']:,}  N_COSMIC={cosmic['N_inj']:,}  "
               f"f_merge={cosmic['N_merge']/cosmic['N_inj']:.4f}")
 
