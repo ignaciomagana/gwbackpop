@@ -173,6 +173,35 @@ P_\mathrm{det}(m_{1,j},m_{2,j},z_j)
 
 where `q(\theta)` is the actual injection proposal density. The proposal density is not optional: changing how injections are drawn changes the denominator.
 
+
+### Diagnostic semi-analytic SNR proxy `pdet`
+
+For smoke tests, sanity checks, emulator seeding, and calibration diagnostics, `gwbackpop-run-injections` can populate `pdet` with a lightweight semi-analytic SNR proxy instead of a pickled interpolator:
+
+```bash
+gwbackpop-run-injections \
+  --config_name lucky_strikes \
+  --likelihood_mode 2D \
+  --pdet_mode snr_proxy \
+  --snr_pdet_method orientation_monte_carlo \
+  --snr_threshold 10.0 \
+  --output_path injections/gwtc3_snr_proxy_pdet.npz \
+  --n_inj 100000 \
+  --n_workers 16
+```
+
+The resulting catalog is consumed by the direct-`pdet` hierarchical mode without special cases:
+
+```bash
+gwbackpop-run-hierarchical \
+  --results_root results \
+  --config_name lucky_strikes \
+  --injections_path injections/gwtc3_snr_proxy_pdet.npz \
+  --output_dir results/hierarchical/lucky_strikes/nuts/direct_pdet_snr_proxy
+```
+
+**Warning:** the SNR proxy is diagnostic, not production selection. It uses a rough chirp-mass and luminosity-distance scaling plus a simple hard-threshold, logistic, or phenomenological orientation Monte Carlo mapping. It ignores search-pipeline ranking statistics, glitch rejection, detector duty cycle, waveform systematics, detailed PSD variation, and FAR thresholds. Compare SNR-proxy `alpha` values and posteriors against LVK/Farr or a calibrated `pdet` model before using them for science; for production, prefer LVK/Farr selection or a validated calibrated `pdet` model.
+
 ### 3. LVK/Farr found-injection estimator
 
 The production selection workflow uses COSMIC merger catalogs plus an LVK found-injection HDF5 file. The code builds a kernel matrix between LVK found injections and COSMIC mergers in `(\log m_1, \log m_2, z)` and uses a Farr-style estimator for `\alpha(\Lambda)`.
