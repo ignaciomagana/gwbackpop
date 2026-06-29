@@ -89,9 +89,9 @@ if [ ! -f "${SAMPLES}" ]; then
     exit 1
 fi
 
-for script in run_backpop.py plot_backpop.py; do
-    if [ ! -f "${script}" ]; then
-        echo "ERROR: ${script} not found in current directory."
+for cmd in gwbackpop-run-event gwbackpop-plot; do
+    if ! command -v "${cmd}" >/dev/null 2>&1; then
+        echo "ERROR: ${cmd} not found. Install the package with: python -m pip install -e '.[test]'"
         exit 1
     fi
 done
@@ -123,7 +123,7 @@ echo ""
 
 T1=$(date +%s)
 
-python run_backpop.py \
+gwbackpop-run-event \
     --samples_path             "${SAMPLES}" \
     --event_name               "${EVENT}" \
     --config_name              lucky_strikes \
@@ -151,7 +151,7 @@ echo ""
 
 T2=$(date +%s)
 
-python run_backpop.py \
+gwbackpop-run-event \
     --samples_path             "${SAMPLES}" \
     --event_name               "${EVENT}" \
     --config_name              lucky_strikes_zform \
@@ -178,7 +178,7 @@ echo ""
 echo "  Plotting 2D run (${DIR_2D})..."
 T3=$(date +%s)
 
-python plot_backpop.py \
+gwbackpop-plot \
     --results_dir  "${DIR_2D}" \
     --samples_path "${SAMPLES}" \
     --approximant  "${APPROXIMANT}" \
@@ -191,7 +191,7 @@ echo ""
 echo "  Plotting 3D run (${DIR_3D})..."
 T3b=$(date +%s)
 
-python plot_backpop.py \
+gwbackpop-plot \
     --results_dir  "${DIR_3D}" \
     --samples_path "${SAMPLES}" \
     --approximant  "${APPROXIMANT}" \
@@ -213,7 +213,7 @@ echo ""
 T4=$(date +%s)
 
 # Write comparison into the 2D directory so both share a common output
-python plot_backpop.py \
+gwbackpop-plot \
     --results_dir  "${DIR_2D}" \
     --compare_dir  "${DIR_3D}" \
     --samples_path "${SAMPLES}" \

@@ -20,10 +20,10 @@
 #   sbatch workflows/slurm/run_catalog_gwtc3.slurm
 #
 # Override PE samples directory:
-#   sbatch --export=ALL,PE_DIR=/path/to/samples run_catalog_gwtc3.slurm
+#   sbatch --export=ALL,PE_DIR=/path/to/samples workflows/slurm/run_catalog_gwtc3.slurm
 #
 # Run a specific subset (e.g. tasks 0–4):
-#   sbatch --array=0-4 run_catalog_gwtc3.slurm
+#   sbatch --array=0-4 workflows/slurm/run_catalog_gwtc3.slurm
 # =============================================================================
 
 #SBATCH --job-name=backpop_gwtc3
@@ -145,6 +145,14 @@ EVENT="${EVENTS[${SLURM_ARRAY_TASK_ID}]}"
 
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate "${CONDA_ENV}"
+
+for cmd in gwbackpop-run-event gwbackpop-plot; do
+    if ! command -v "${cmd}" >/dev/null 2>&1; then
+        echo "ERROR: ${cmd} not found after activating ${CONDA_ENV}."
+        echo "Install with: python -m pip install -e '.[cosmic]' or activate the correct environment."
+        exit 1
+    fi
+done
 
 echo "============================================================"
 echo " Task:    ${SLURM_ARRAY_TASK_ID} / $((N_EVENTS-1))"

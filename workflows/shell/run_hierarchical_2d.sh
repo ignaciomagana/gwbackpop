@@ -8,12 +8,12 @@
 # injection campaign; production selection-corrected inference should use
 # run_hierarchical_3d.sh because selection effects are mass-redshift dependent.
 # Uses lucky_strikes posteriors (KDE over mc, q — flat logZ prior).
-# Sampler: NumPyro NUTS (HMC), implemented in hierarchical_backpop_jax.py.
+# Sampler: NumPyro NUTS (HMC), implemented in gwbackpop.inference.hierarchical.
 #
 # Prerequisites:
 #   1. SLURM catalog runs finished:  results/*/lucky_strikes/log_z.npy exist
 #   2. COSMIC merger catalog built:  injections/gwtc3_cosmic_mergers.npz exists
-#                                    (run_injections.py --config_name lucky_strikes without --pdet_path)
+#                                    (gwbackpop-run-injections --config_name lucky_strikes without --pdet_path)
 #   3. LVK found injection file:     $LVK_FOUND_PATH exists
 #
 # Selection effects: Farr (2019) estimator using raw LVK found injections.
@@ -79,6 +79,13 @@ OUTPUT_DIR="${RESULTS_ROOT}/hierarchical/${CONFIG_NAME}/nuts/lvk_farr"
 # ---------------------------------------------------------------------------
 # Pre-flight checks
 # ---------------------------------------------------------------------------
+
+for cmd in gwbackpop-run-hierarchical; do
+    if ! command -v "${cmd}" >/dev/null 2>&1; then
+        echo "ERROR: ${cmd} not found. Install the package with: python -m pip install -e '.[test]'"
+        exit 1
+    fi
+done
 
 echo "============================================================"
 echo " BackPop Hierarchical — 2D (NUTS/HMC)"

@@ -6,15 +6,17 @@ The repository currently contains three main workflows. The installed console co
 
 | Workflow | Main entry point | Purpose | Status |
 |---|---|---|---|
-| Single-event 2D mass-only inference | `gwbackpop-run-event` (`python run_backpop.py` wrapper) | Infer binary-evolution parameters for one GW event using a KDE likelihood in source-frame chirp mass and mass ratio, `(\mathcal{M}_c, q)`. | **Production-ready baseline**. This is the most mature single-event mode. |
-| Single-event 3D mass-redshift inference | `gwbackpop-run-event --use_redshift_likelihood True` (`python run_backpop.py` wrapper) | Infer binary-evolution parameters for one GW event using `(\mathcal{M}_c, q, z_\mathrm{merger})` plus cosmological priors on formation redshift and metallicity. | **Production-ready if the PE samples and selection campaign are generated consistently**. Treat 2D/3D comparisons as model-dependent. |
-| Hierarchical population inference | `gwbackpop-run-hierarchical` (`python hierarchical_backpop_jax.py` wrapper) | Reweight per-event BackPop posteriors under a population hypermodel and optionally apply selection corrections. | **Production-ready only for the LVK/Farr found-injection selection estimator or explicit no-selection diagnostics**. Direct `pdet` hierarchical selection is not implemented in the JAX driver. |
+| Single-event 2D mass-only inference | `gwbackpop-run-event` | Infer binary-evolution parameters for one GW event using a KDE likelihood in source-frame chirp mass and mass ratio, `(\mathcal{M}_c, q)`. | **Production-ready baseline**. This is the most mature single-event mode. |
+| Single-event 3D mass-redshift inference | `gwbackpop-run-event --use_redshift_likelihood True` | Infer binary-evolution parameters for one GW event using `(\mathcal{M}_c, q, z_\mathrm{merger})` plus cosmological priors on formation redshift and metallicity. | **Production-ready if the PE samples and selection campaign are generated consistently**. Treat 2D/3D comparisons as model-dependent. |
+| Hierarchical population inference | `gwbackpop-run-hierarchical` | Reweight per-event BackPop posteriors under a population hypermodel and optionally apply selection corrections. | **Production-ready only for the LVK/Farr found-injection selection estimator or explicit no-selection diagnostics**. Direct `pdet` hierarchical selection is not implemented in the JAX driver. |
 
 Additional utilities:
 
-- `gwbackpop-run-injections` (`python run_injections.py`) builds COSMIC merger catalogs for selection corrections. It can either store a direct `P_det(m_1, m_2, z)` value from a pickled interpolator or store `pdet=nan` for the LVK/Farr workflow.
-- `gwbackpop-plot` (`python plot_backpop.py`) makes diagnostic figures from single-event output directories.
+- `gwbackpop-run-injections` builds COSMIC merger catalogs for selection corrections. It can either store a direct `P_det(m_1, m_2, z)` value from a pickled interpolator or store `pdet=nan` for the LVK/Farr workflow.
+- `gwbackpop-plot` makes diagnostic figures from single-event output directories.
 - `workflows/shell/run_hierarchical_2d.sh`, `workflows/shell/run_hierarchical_3d.sh`, and `workflows/slurm/run_catalog_gwtc3.slurm` are convenience wrappers for catalog-scale analyses.
+
+Legacy root-level Python wrappers may remain temporarily for backwards compatibility, but documented workflows and CI use the installed console commands.
 
 
 ## Repository layout
@@ -108,7 +110,7 @@ Z_i
 
 Here:
 
-- `Z_i` is the single-event evidence saved by `run_backpop.py` as `log_z.npy`.
+- `Z_i` is the single-event evidence saved by `gwbackpop-run-event` as `log_z.npy`.
 - `\langle\cdot\rangle_i` is an average over posterior samples for event `i`.
 - `p(\theta\mid\Lambda)` is the population model.
 - `\alpha(\Lambda)` is the detectable fraction under that population model.
@@ -138,7 +140,7 @@ Run `gwbackpop-run-hierarchical` without `--injections_path` and without `--lvk_
 
 ### 2. Direct `pdet` estimator
 
-`run_injections.py --pdet_path /path/to/pdet_interpolator.pkl` evaluates a user-provided callable `P_det(m1_src, m2_src, z_merger)` for each COSMIC merger and stores the result in the injection `.npz`. This is useful for building and auditing direct detection-probability campaigns.
+`gwbackpop-run-injections --pdet_path /path/to/pdet_interpolator.pkl` evaluates a user-provided callable `P_det(m1_src, m2_src, z_merger)` for each COSMIC merger and stores the result in the injection `.npz`. This is useful for building and auditing direct detection-probability campaigns.
 
 However, the current JAX hierarchical driver intentionally hard-errors if `--injections_path` is provided without `--lvk_found_path`, because the old direct-interpolator hierarchical path is not implemented there. Treat direct-`pdet` hierarchical selection as **not production-ready in this repository version** unless you add and validate that estimator yourself.
 
@@ -160,7 +162,7 @@ The production selection workflow uses COSMIC merger catalogs plus an LVK found-
 
 Use this mode by passing both:
 
-- `--injections_path`: COSMIC merger catalog from `run_injections.py`.
+- `--injections_path`: COSMIC merger catalog from `gwbackpop-run-injections`.
 - `--lvk_found_path`: LVK found-injection HDF5 containing source masses, redshift, and `sampling_pdf`.
 
 This is the **recommended production hierarchical mode**, subject to the caveats below.
@@ -184,7 +186,7 @@ Do not mix 2D event posteriors with 3D injection campaigns, or vice versa, unles
 
 ### PESummary GW posterior files
 
-`run_backpop.py --samples_path` expects a PESummary-compatible GW posterior file, usually HDF5. The code loads event posterior samples, builds a KDE in the requested coordinates, and uses the chosen approximant group, defaulting to `C01:Mixed`.
+`gwbackpop-run-event --samples_path` expects a PESummary-compatible GW posterior file, usually HDF5. The code loads event posterior samples, builds a KDE in the requested coordinates, and uses the chosen approximant group, defaulting to `C01:Mixed`.
 
 Important expectations:
 
@@ -194,7 +196,7 @@ Important expectations:
 
 ### COSMIC injection `.npz`
 
-`run_injections.py` writes an `.npz` file containing the COSMIC merger catalog used for selection calculations. Important arrays and metadata include:
+`gwbackpop-run-injections` writes an `.npz` file containing the COSMIC merger catalog used for selection calculations. Important arrays and metadata include:
 
 - `theta`: full sampled parameter vectors for merging COSMIC binaries.
 - `params`: parameter names matching the columns of `theta`.
@@ -320,7 +322,7 @@ gwbackpop-run-hierarchical \
 
 ### Single-event output
 
-`run_backpop.py` writes to `results/<event_name>/<config_name>/`:
+`gwbackpop-run-event` writes to `results/<event_name>/<config_name>/`:
 
 - `points.npy`: posterior samples in BackPop parameter space.
 - `log_w.npy`: log importance weights.
@@ -389,11 +391,11 @@ If that does not work, follow the COSMIC installation instructions for your syst
 Fast local checks that do not require COSMIC are:
 
 ```bash
-python smoke_test_imports.py --skip-cosmic
+gwbackpop-smoke-test --skip-cosmic
 pytest tests/test_lightweight_infrastructure.py tests/test_truncated_population_densities.py tests/test_hierarchical_toy_recovery.py tests/test_selection_model_consistency.py tests/test_default_hyperparams.py
 ```
 
-Injection catalogs written by `run_injections.py` keep their full scientific
+Injection catalogs written by `gwbackpop-run-injections` keep their full scientific
 arrays in the requested catalog NPZ and write metadata to a separate
 `*_metadata.npz`/JSON sidecar.  Two-dimensional catalogs record `z_form` as an
 auxiliary proposal draw: when explicit `log_q_proposal` weights are present,
@@ -405,7 +407,7 @@ active BackPop config.
 After installing COSMIC, run the full smoke import check with:
 
 ```bash
-python smoke_test_imports.py
+gwbackpop-smoke-test
 ```
 
 Heavy tests and production workflows that evolve COSMIC binaries or consume GW/LVK data products are intentionally kept separate from the GitHub Actions lightweight test job.

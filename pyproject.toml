@@ -20,6 +20,7 @@ dependencies = [
   "h5py",
   "matplotlib",
   "corner",
+  "seaborn",
   "arviz",
 ]
 
@@ -42,8 +43,6 @@ markers = [
   "cosmic: tests that import or run COSMIC binary-evolution code",
 ]
 
-[tool.setuptools]
-py-modules = ["run_backpop"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

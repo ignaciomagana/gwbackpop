@@ -6,12 +6,12 @@
 # RECOMMENDED PRODUCTION SCRIPT for selection-corrected hierarchical inference.
 # Uses lucky_strikes_zform posteriors (KDE over mc, q, z_merger +
 # Andrews+2021 cosmological priors on z_form and logZ).
-# Sampler: NumPyro NUTS (HMC), implemented in hierarchical_backpop_jax.py.
+# Sampler: NumPyro NUTS (HMC), implemented in gwbackpop.inference.hierarchical.
 #
 # Prerequisites:
-#   1. cosmo_prior.py fix deployed (z_merger_from_t_delay bug fixed).
+#   1. gwbackpop.cosmology fix deployed (z_merger_from_t_delay bug fixed).
 #   2. SLURM catalog re-runs finished: results/*/lucky_strikes_zform/log_z.npy
-#   3. COSMIC merger catalog re-run with fixed cosmo_prior.py:
+#   3. COSMIC merger catalog re-run with fixed gwbackpop.cosmology:
 #      injections/gwtc3_cosmic_mergers.npz  (old pre-fix NPZ is invalid)
 #   4. LVK found injection file available.
 #   5. Optional: run_hierarchical_2d.sh completed for a diagnostic comparison.
@@ -65,6 +65,13 @@ DIR_2D="${RESULTS_ROOT}/hierarchical/lucky_strikes/nuts/lvk_farr"
 # Pre-flight checks
 # ---------------------------------------------------------------------------
 
+for cmd in gwbackpop-run-hierarchical; do
+    if ! command -v "${cmd}" >/dev/null 2>&1; then
+        echo "ERROR: ${cmd} not found. Install the package with: python -m pip install -e '.[test]'"
+        exit 1
+    fi
+done
+
 echo "============================================================"
 echo " BackPop Hierarchical — 3D (NUTS/HMC)"
 echo " Config:       ${CONFIG_NAME}"
@@ -76,7 +83,7 @@ echo " NUTS: ${NUM_CHAINS} chains x ${NUM_WARMUP} warmup + ${NUM_SAMPLES} sample
 echo " K matrix subsampled to N_found=${LVK_N_FOUND_MAX}"
 echo "============================================================"
 
-# Validate injection campaign was built with fixed cosmo_prior.py
+# Validate injection campaign was built with fixed gwbackpop.cosmology
 echo ""
 echo ">>> Checking injection campaign integrity..."
 python -c "
@@ -85,8 +92,8 @@ data  = np.load('${INJECTIONS_PATH}', allow_pickle=True)
 z_max = float(data['z_merger'].max())
 if z_max > 10:
     print(f'ERROR: z_merger max = {z_max:.1f} in injection NPZ.')
-    print('The pre-fix cosmo_prior.py was used — z_merger values are wrong.')
-    print('Delete the NPZ and re-run run_injections.py --config_name lucky_strikes with the fixed cosmo_prior.py.')
+    print('The pre-fix gwbackpop.cosmology was used — z_merger values are wrong.')
+    print('Delete the NPZ and re-run gwbackpop-run-injections --config_name lucky_strikes with the fixed gwbackpop.cosmology.')
     sys.exit(1)
 print(f'Injection NPZ valid: z_merger max = {z_max:.3f}')
 " || exit 1
@@ -239,7 +246,7 @@ echo " Outputs in: ${OUTPUT_DIR}/"
 echo ""
 echo " NOTE: NUTS does not compute log Z (marginal likelihood)."
 echo " For 2D vs 3D model comparison, either:"
-echo "   a) Re-run with hierarchical_backpop.py (Nautilus — gives log Z)"
+echo "   a) Re-run with gwbackpop-run-hierarchical using a Nautilus backend when available — gives log Z"
 echo "   b) Use ArviZ bridge sampling: arviz.waic() or loo() on both runs"
 echo ""
 
