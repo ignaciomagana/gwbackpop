@@ -17,6 +17,13 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e '.[test]'
       - name: Smoke-test non-COSMIC imports
-        run: python smoke_test_imports.py --skip-cosmic
+        run: gwbackpop-smoke-test --skip-cosmic
+      - name: Smoke-test console entry points
+        run: |
+          gwbackpop-run-event --help
+          gwbackpop-run-injections --help
+          gwbackpop-run-hierarchical --help
+          gwbackpop-plot --help
+          gwbackpop-smoke-test --help
       - name: Run lightweight tests
-        run: pytest tests/test_lightweight_infrastructure.py tests/test_truncated_population_densities.py tests/test_hierarchical_toy_recovery.py tests/test_selection_model_consistency.py tests/test_default_hyperparams.py tests/test_injection_proposal.py
+        run: pytest tests/test_lightweight_infrastructure.py tests/test_truncated_population_densities.py tests/test_hierarchical_toy_recovery.py tests/test_selection_model_consistency.py tests/test_default_hyperparams.py tests/test_injection_proposal.py tests/test_cli_invocation_hygiene.py tests/test_console_entrypoints.py

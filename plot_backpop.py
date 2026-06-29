@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+# Legacy compatibility wrapper. Prefer the installed console command.
 """Compatibility wrapper. Prefer ``gwbackpop-plot``."""
 from pathlib import Path
 import sys

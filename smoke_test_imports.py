@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+# Legacy compatibility wrapper. Prefer the installed console command.
 """Compatibility wrapper. Prefer ``gwbackpop-smoke-test``."""
 from pathlib import Path
 import sys

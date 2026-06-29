@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+# Legacy compatibility wrapper. Prefer the installed console command.
 """Compatibility wrapper. Prefer ``gwbackpop-run-event``."""
 import sys
 from pathlib import Path
