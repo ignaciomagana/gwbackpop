@@ -1,6 +1,6 @@
 """
-run_injections.py
------------------
+Selection injection catalog generation
+--------------------------------------
 Pre-compute the injection campaign needed for selection effects in the
 hierarchical BackPop analysis.
 
@@ -29,14 +29,14 @@ physics dimensions, identical to EventPosterior.log_weight_ratio.
 
 Usage
 -----
-  python run_injections.py \\
+  gwbackpop-run-injections \\
       --pdet_path     /path/to/pdet_interpolator.pkl \\
       --output_path   injections/gwtc3_injections.npz \\
       --n_inj         1000000 \\
       --n_workers     64
 
   # Estimate merger fraction first (fast, N=10000):
-  python run_injections.py \\
+  gwbackpop-run-injections \\
       --pdet_path  /path/to/pdet_interpolator.pkl \\
       --output_path injections/test.npz \\
       --n_inj      10000 --n_workers 8 --dry_run True

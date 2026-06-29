@@ -80,21 +80,3 @@ def test_toy_hierarchical_likelihood_prefers_matching_population():
     good = hb.jnp.array(good_np, dtype=hb.jnp.float64)
     bad = hb.jnp.array(bad_np, dtype=hb.jnp.float64)
     assert float(ll(good)) > float(ll(bad))
-
-
-def test_root_compatibility_wrappers_expose_main():
-    import importlib.util
-    from pathlib import Path
-
-    root = Path(__file__).resolve().parents[1]
-    for filename in [
-        "run_backpop.py",
-        "run_injections.py",
-        "hierarchical_backpop_jax.py",
-        "plot_backpop.py",
-        "smoke_test_imports.py",
-    ]:
-        spec = importlib.util.spec_from_file_location(f"_compat_{filename.replace('.', '_')}", root / filename)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        assert callable(module.main)

@@ -154,8 +154,8 @@ def test_likelihood_3d_accepts_config_logz_support(monkeypatch):
     fake_backpop.COLS_KEEP = []
     monkeypatch.setitem(sys.modules, "backpop", fake_backpop)
 
-    sys.modules.pop("run_backpop", None)
-    run_backpop = importlib.import_module("run_backpop")
+    sys.modules.pop("gwbackpop.inference.single_event", None)
+    run_backpop = importlib.import_module("gwbackpop.inference.single_event")
 
     monkeypatch.setattr(
         run_backpop,
