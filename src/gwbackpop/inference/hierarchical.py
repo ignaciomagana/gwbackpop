@@ -687,6 +687,89 @@ def make_log_alpha_fn(
     return log_alpha
 
 
+def _prepare_injection_weight_terms(
+    theta_inj: jnp.ndarray,
+    lo_inj: jnp.ndarray,
+    hi_inj: jnp.ndarray,
+    param_idx_inj: dict[str, int],
+    kick_sigma: float,
+    log_q_proposal: jnp.ndarray | None = None,
+    log_pop_static: jnp.ndarray | None = None,
+):
+    """Prepare shared JAX COSMIC-merger population/proposal accounting."""
+    def _col(name):
+        idx = param_idx_inj.get(name)
+        return theta_inj[:, idx] if idx is not None else None
+    cols = {name: _col(name) for name in ('alpha_1', 'alpha_2', 'flim_1', 'flim_2', 'vk1', 'vk2')}
+    def _log_pi0_inj(name):
+        idx = param_idx_inj.get(name)
+        return 0.0 if idx is None else float(-jnp.log(hi_inj[idx] - lo_inj[idx]))
+    def _support_inj(name):
+        idx = param_idx_inj.get(name)
+        return (0.0, 1.0) if idx is None else (float(lo_inj[idx]), float(hi_inj[idx]))
+    supports = {name: _support_inj(name) for name in ('alpha_1', 'alpha_2', 'vk1', 'vk2')}
+    lpi0 = {name: _log_pi0_inj(name) for name in ('alpha_1', 'alpha_2', 'flim_1', 'flim_2')}
+    if log_q_proposal is None:
+        warnings.warn("Injection file lacks log_q_proposal; falling back to legacy proposal reconstruction from bounds and kick_proposal_sigma.", RuntimeWarning)
+        use_explicit_q = False
+        log_q = None
+        static_pop = None
+    else:
+        use_explicit_q = True
+        log_q = log_q_proposal
+        static_pop = jnp.zeros(theta_inj.shape[0]) if log_pop_static is None else log_pop_static
+    def log_wr_injections(lp_vec: jnp.ndarray) -> jnp.ndarray:
+        mu_la1, sig_la1 = lp_vec[0], lp_vec[1]
+        mu_la2, sig_la2 = lp_vec[2], lp_vec[3]
+        af1, bf1 = lp_vec[4], lp_vec[5]
+        af2, bf2 = lp_vec[6], lp_vec[7]
+        sv1, sv2 = lp_vec[8], lp_vec[9]
+        if use_explicit_q:
+            log_wr = static_pop - log_q
+            if cols['alpha_1'] is not None: log_wr = log_wr + log_p_alpha_jax(cols['alpha_1'], mu_la1, sig_la1, *supports['alpha_1'])
+            if cols['alpha_2'] is not None: log_wr = log_wr + log_p_alpha_jax(cols['alpha_2'], mu_la2, sig_la2, *supports['alpha_2'])
+            if cols['flim_1'] is not None: log_wr = log_wr + log_p_flim_jax(cols['flim_1'], af1, bf1)
+            if cols['flim_2'] is not None: log_wr = log_wr + log_p_flim_jax(cols['flim_2'], af2, bf2)
+            if cols['vk1'] is not None: log_wr = log_wr + log_p_vk_jax(cols['vk1'], sv1, *supports['vk1'])
+            if cols['vk2'] is not None: log_wr = log_wr + log_p_vk_jax(cols['vk2'], sv2, *supports['vk2'])
+            return log_wr
+        log_wr = jnp.zeros(theta_inj.shape[0])
+        if cols['alpha_1'] is not None: log_wr = log_wr + log_p_alpha_jax(cols['alpha_1'], mu_la1, sig_la1, *supports['alpha_1']) - lpi0['alpha_1']
+        if cols['alpha_2'] is not None: log_wr = log_wr + log_p_alpha_jax(cols['alpha_2'], mu_la2, sig_la2, *supports['alpha_2']) - lpi0['alpha_2']
+        if cols['flim_1'] is not None: log_wr = log_wr + log_p_flim_jax(cols['flim_1'], af1, bf1) - lpi0['flim_1']
+        if cols['flim_2'] is not None: log_wr = log_wr + log_p_flim_jax(cols['flim_2'], af2, bf2) - lpi0['flim_2']
+        if cols['vk1'] is not None: log_wr = log_wr + log_p_vk_jax(cols['vk1'], sv1, *supports['vk1']) - log_p_vk_jax(cols['vk1'], kick_sigma, *supports['vk1'])
+        if cols['vk2'] is not None: log_wr = log_wr + log_p_vk_jax(cols['vk2'], sv2, *supports['vk2']) - log_p_vk_jax(cols['vk2'], kick_sigma, *supports['vk2'])
+        return log_wr
+    return log_wr_injections
+
+def validate_direct_pdet_inputs(theta_inj: np.ndarray, pdet: np.ndarray | None, n_inj_total: int) -> dict:
+    """Validate direct-pdet selection inputs before JIT/NUTS starts."""
+    msg = "direct-pdet selection requires an injection NPZ built with: gwbackpop-run-injections --pdet_path /path/to/pdet.pkl ..."
+    if n_inj_total <= 0: raise ValueError("direct-pdet selection requires N_inj > 0")
+    if pdet is None: raise ValueError(f"Missing pdet array; {msg}")
+    pdet_arr = np.asarray(pdet, dtype=np.float64)
+    if pdet_arr.shape[0] != np.asarray(theta_inj).shape[0]: raise ValueError("direct-pdet pdet shape must match the number of stored merging injections")
+    finite = np.isfinite(pdet_arr)
+    if not finite.all(): raise ValueError(f"Invalid non-finite pdet values; {msg}. If pdet=nan, either provide --lvk_found_path for LVK/Farr mode or rebuild the catalog with --pdet_path.")
+    if np.any((pdet_arr < 0.0) | (pdet_arr > 1.0)): raise ValueError("direct-pdet pdet values must satisfy 0 <= pdet <= 1")
+    positive = pdet_arr > 0.0
+    if not positive.any(): raise ValueError("direct-pdet selection has all pdet == 0; alpha is zero and the hierarchical likelihood is undefined")
+    return dict(finite_pdet_count=int(finite.sum()), positive_pdet_count=int(positive.sum()), mean_pdet_mergers=float(np.mean(pdet_arr)))
+
+def make_log_alpha_direct_pdet_fn(theta_inj: jnp.ndarray, pdet: jnp.ndarray, lo_inj: jnp.ndarray, hi_inj: jnp.ndarray, param_idx_inj: dict[str, int], n_inj_total: int, kick_sigma: float, log_q_proposal: jnp.ndarray | None = None, log_pop_static: jnp.ndarray | None = None) -> callable:
+    """Return JIT-compiled direct-pdet alpha: logsumexp(log pdet + log p/q) - log N_inj."""
+    validate_direct_pdet_inputs(np.asarray(theta_inj), np.asarray(pdet) if pdet is not None else None, int(n_inj_total))
+    log_wr_injections = _prepare_injection_weight_terms(theta_inj, lo_inj, hi_inj, param_idx_inj, kick_sigma, log_q_proposal, log_pop_static)
+    pdet = jnp.asarray(pdet, dtype=jnp.float64)
+    log_n_inj = jnp.log(float(n_inj_total))
+    @jit
+    def log_alpha_direct(lp_vec: jnp.ndarray) -> jnp.ndarray:
+        log_wr = log_wr_injections(lp_vec)
+        log_pdet = jnp.where(pdet > 0.0, jnp.log(pdet), -jnp.inf)
+        return jsp.special.logsumexp(log_pdet + log_wr) - log_n_inj
+    return log_alpha_direct
+
 # ---------------------------------------------------------------------------
 # Hierarchical likelihood (pure JAX)
 # ---------------------------------------------------------------------------
@@ -1261,7 +1344,7 @@ def write_event_reweighting_diagnostics_csv(path: str, rows: list[dict]) -> None
     with open(path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows([{field: row.get(field, "") for field in fields} for row in rows])
 
 
 def compute_selection_weight_diagnostics(
@@ -1313,6 +1396,7 @@ def compute_selection_weight_diagnostics(
         top_1 = top_0p1 = np.nan
     return dict(
         hyperpoint=label,
+        selection_mode="lvk_farr",
         found_injection_count=summary["n_total"],
         cosmic_merger_count=int(K_np.shape[1]),
         positive_contribution_count=int(contrib.size),
@@ -1325,16 +1409,31 @@ def compute_selection_weight_diagnostics(
     )
 
 
+
+def compute_direct_pdet_selection_weight_diagnostics(lp_vec: np.ndarray, label: str, cosmic: dict) -> dict:
+    """Compute direct-pdet merger-catalog contribution diagnostics for alpha."""
+    log_wr = compute_log_wr_injections_numpy(lp_vec, cosmic["theta"], cosmic["params"], cosmic["lo"], cosmic["hi"], cosmic["kick_sigma"], cosmic.get("log_q_proposal"), cosmic.get("log_pop_static"))
+    pdet = np.asarray(cosmic.get("pdet"), dtype=np.float64)
+    log_contrib = np.where(pdet > 0.0, np.log(pdet), -np.inf) + log_wr - np.log(float(cosmic["N_inj"]))
+    summary = _importance_weight_summary_from_log_weights(log_contrib)
+    finite_contrib = log_contrib[np.isfinite(log_contrib)]
+    contrib = np.exp(finite_contrib - np.max(finite_contrib)) if finite_contrib.size else np.array([], dtype=np.float64)
+    contrib = contrib[contrib > 0.0]
+    if contrib.size:
+        norm = np.sort(contrib / contrib.sum())[::-1]; n = norm.size; top_1 = norm[:max(1, int(np.ceil(0.01*n)))].sum(); top_0p1 = norm[:max(1, int(np.ceil(0.001*n)))].sum()
+    else: top_1 = top_0p1 = np.nan
+    return dict(hyperpoint=label, selection_mode="direct_pdet", injection_count_total=int(cosmic["N_inj"]), merging_injection_count=int(cosmic["N_merge"]), finite_pdet_count=int(np.isfinite(pdet).sum()), positive_pdet_count=int((pdet > 0.0).sum()), positive_contribution_count=int(contrib.size), injection_ess=summary["ess"], ess_fraction=summary["ess_fraction"], max_contribution=summary["max_normalized_weight"], top_1pct_alpha_fraction=float(top_1), top_0p1pct_alpha_fraction=float(top_0p1), warning=summary["warning"])
+
 def print_selection_weight_diagnostics(rows: list[dict]) -> None:
     """Print selection-integral contribution diagnostics."""
     if not rows:
         return
     print("\n Selection injection diagnostics:")
-    print(f"  {'hyperpoint':<18s} {'N_found':>8s} {'ESS':>10s} {'ESS/N':>8s} {'max':>10s} {'top1%':>8s} {'top0.1%':>8s} {'flag':>8s}")
+    print(f"  {'hyperpoint':<18s} {'N_sel':>8s} {'ESS':>10s} {'ESS/N':>8s} {'max':>10s} {'top1%':>8s} {'top0.1%':>8s} {'flag':>8s}")
     print("  " + "-" * 94)
     for row in rows:
         print(f"  {row['hyperpoint']:<18.18s} "
-              f"{row['found_injection_count']:8d} "
+              f"{int(row.get('found_injection_count', row.get('merging_injection_count', 0))):8d} "
               f"{row['injection_ess']:10.1f} "
               f"{row['ess_fraction']:8.4f} "
               f"{row['max_contribution']:10.3e} "
@@ -1346,15 +1445,16 @@ def print_selection_weight_diagnostics(rows: list[dict]) -> None:
 def write_selection_weight_diagnostics_csv(path: str, rows: list[dict]) -> None:
     import csv
     fields = [
-        "hyperpoint", "found_injection_count", "cosmic_merger_count",
-        "positive_contribution_count", "injection_ess", "ess_fraction",
+        "hyperpoint", "selection_mode", "found_injection_count", "cosmic_merger_count",
+        "injection_count_total", "merging_injection_count", "finite_pdet_count",
+        "positive_pdet_count", "positive_contribution_count", "injection_ess", "ess_fraction",
         "max_contribution", "top_1pct_alpha_fraction",
         "top_0p1pct_alpha_fraction", "warning",
     ]
     with open(path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows([{field: row.get(field, "") for field in fields} for row in rows])
 
 
 def discover_events(results_root: str, config_name: str) -> list[str]:
@@ -1434,15 +1534,31 @@ def determine_selection_mode(injections_path: str | None, lvk_found_path: str | 
     if has_lvk and not has_cosmic:
         raise ValueError("--lvk_found_path requires --injections_path")
     if has_cosmic and not has_lvk:
-        raise NotImplementedError(
-            "--injections_path without --lvk_found_path would select the "
-            "unimplemented interpolator selection mode. Provide "
-            "--lvk_found_path to enable the LVK/Farr selection correction, or "
-            "omit --injections_path to run with selection effects disabled."
-        )
+        return "direct_pdet"
+
 
     return "lvk_farr" if (has_lvk and has_cosmic) else "none"
 
+
+
+def load_cosmic_merger_catalog_for_selection(injections_path: str, event_model_metadata: list[dict], allow_inconsistent_selection_model: bool) -> tuple[dict, dict, bool, str]:
+    """Load COSMIC merger injection NPZ and shared proposal/static-pop accounting."""
+    cosmic_raw = np.load(injections_path, allow_pickle=True)
+    injection_model_metadata = dict(cosmic_raw["metadata"].item()) if "metadata" in cosmic_raw else {}
+    injection_model_metadata.update({
+        "likelihood_mode": _npz_scalar(cosmic_raw, "likelihood_mode", injection_model_metadata.get("likelihood_mode", "3D" if "z_form" in cosmic_raw else "2D")),
+        "uses_z_form": _npz_scalar(cosmic_raw, "uses_z_form", injection_model_metadata.get("uses_z_form", "z_form" in cosmic_raw)),
+        "uses_aux_z_form": _npz_scalar(cosmic_raw, "uses_aux_z_form", injection_model_metadata.get("uses_aux_z_form", False)),
+        "uses_sfr_prior": _npz_scalar(cosmic_raw, "uses_sfr_prior", injection_model_metadata.get("uses_sfr_prior", "z_form" in cosmic_raw)),
+        "uses_logZ_given_z_prior": _npz_scalar(cosmic_raw, "uses_logZ_given_z_prior", injection_model_metadata.get("uses_logZ_given_z_prior", "z_form" in cosmic_raw and "logZ" in cosmic_raw)),
+        "proposal_version": _npz_scalar(cosmic_raw, "proposal_version", injection_model_metadata.get("proposal_version", "unknown")),
+    })
+    selection_model_consistent, selection_model_consistency_message = validate_selection_model_consistency(event_model_metadata, injection_model_metadata, allow_inconsistent_selection_model)
+    log_q_arr = cosmic_raw['log_q_proposal'].astype(np.float64) if 'log_q_proposal' in cosmic_raw else None
+    if log_q_arr is not None and not np.all(np.isfinite(log_q_arr)): raise ValueError("log_q_proposal contains non-finite values")
+    log_pop_static_arr = np.zeros(cosmic_raw['theta'].shape[0], dtype=np.float64) if log_q_arr is not None else None
+    cosmic = dict(theta=cosmic_raw['theta'].astype(np.float64), m1_src=cosmic_raw['m1_src'].astype(np.float64) if 'm1_src' in cosmic_raw else np.array([]), m2_src=cosmic_raw['m2_src'].astype(np.float64) if 'm2_src' in cosmic_raw else np.array([]), z_merger=cosmic_raw['z_merger'].astype(np.float64) if 'z_merger' in cosmic_raw else np.array([]), pdet=cosmic_raw['pdet'].astype(np.float64) if 'pdet' in cosmic_raw else None, params=list(cosmic_raw['params']), lo=cosmic_raw['lower_bound'].astype(np.float64), hi=cosmic_raw['upper_bound'].astype(np.float64), N_inj=int(cosmic_raw['N_inj'].ravel()[0]), N_merge=int(cosmic_raw['N_merge'].ravel()[0]), kick_sigma=float(cosmic_raw['kick_proposal_sigma'].ravel()[0] if 'kick_proposal_sigma' in cosmic_raw else 50.0), log_q_proposal=log_q_arr, log_pop_static=log_pop_static_arr)
+    return cosmic, injection_model_metadata, selection_model_consistent, selection_model_consistency_message
 
 def lvk_found_subsample_log_scaling(N_found_total: int, N_found_used: int) -> float:
     """Return the log correction for LVK found-injection subsampling.
@@ -1473,7 +1589,7 @@ def main():
     )
 
     # Output directory
-    _tag = {"none": "no_selection", "lvk_farr": "lvk_farr"}
+    _tag = {"none": "no_selection", "direct_pdet": "direct_pdet", "lvk_farr": "lvk_farr"}
     out_dir = opts.output_dir or os.path.join(
         opts.results_root, "hierarchical", opts.config_name, "nuts",
         _tag[selection_mode]
@@ -1549,7 +1665,22 @@ def main():
         injection_attrs={},
         dataset_attrs={},
     )
-    if selection_mode == "lvk_farr":
+    if selection_mode == "direct_pdet":
+        print(f"\n Loading COSMIC merger catalog: {opts.injections_path}")
+        cosmic, injection_model_metadata, selection_model_consistent, selection_model_consistency_message = load_cosmic_merger_catalog_for_selection(opts.injections_path, event_model_metadata, opts.allow_inconsistent_selection_model)
+        cosmic_raw = np.load(opts.injections_path, allow_pickle=True)
+        print(f"  Selection model consistency: {selection_model_consistency_message}")
+        pdet_stats = validate_direct_pdet_inputs(cosmic['theta'], cosmic.get('pdet'), cosmic['N_inj'])
+        pidx_inj = {p: i for i, p in enumerate(cosmic['params'])}
+        log_alpha_fn = make_log_alpha_direct_pdet_fn(jnp.array(cosmic['theta']), jnp.array(cosmic['pdet']), jnp.array(cosmic['lo']), jnp.array(cosmic['hi']), pidx_inj, cosmic['N_inj'], cosmic['kick_sigma'], (jnp.array(cosmic['log_q_proposal']) if cosmic['log_q_proposal'] is not None else None), (jnp.array(cosmic['log_pop_static']) if cosmic['log_pop_static'] is not None else None))
+        print("  Selection effects: ENABLED (direct pdet estimator)")
+        print(f"  N_inj = {cosmic['N_inj']:,}")
+        print(f"  N_merge = {cosmic['N_merge']:,}")
+        print(f"  finite pdet = {pdet_stats['finite_pdet_count']:,}")
+        print(f"  positive pdet = {pdet_stats['positive_pdet_count']:,}")
+        print(f"  mean pdet among mergers = {pdet_stats['mean_pdet_mergers']:.6g}")
+
+    elif selection_mode == "lvk_farr":
         print(f"\n Loading LVK found injections: {opts.lvk_found_path}")
         lvk = load_lvk_injections(opts.lvk_found_path, opts.lvk_n_inj_total, opts.strict_lvk_sampling_pdf)
         lvk_sampling_pdf_metadata = lvk['sampling_pdf_metadata']
@@ -1722,7 +1853,13 @@ def main():
     print(f"  Event reweighting diagnostics CSV: {event_diag_path}")
 
     selection_diagnostic_rows = []
-    if selection_mode == "lvk_farr" and K_np is not None and cosmic is not None:
+    if selection_mode == "direct_pdet" and cosmic is not None:
+        selection_diagnostic_rows.append(compute_direct_pdet_selection_weight_diagnostics(np.asarray(dummy_lp), "default_pre_nuts", cosmic))
+        print_selection_weight_diagnostics(selection_diagnostic_rows)
+        selection_diag_path = os.path.join(out_dir, "selection_weight_diagnostics.csv")
+        write_selection_weight_diagnostics_csv(selection_diag_path, selection_diagnostic_rows)
+        print(f"  Selection diagnostics CSV: {selection_diag_path}")
+    elif selection_mode == "lvk_farr" and K_np is not None and cosmic is not None:
         selection_diagnostic_rows.append(compute_selection_weight_diagnostics(
             np.asarray(dummy_lp), "default_pre_nuts", K_np, log_v, cosmic
         ))
@@ -1806,7 +1943,13 @@ def main():
                 )
             )
 
-    if selection_mode == "lvk_farr" and K_np is not None and cosmic is not None:
+    if selection_mode == "direct_pdet" and cosmic is not None:
+        selection_diagnostic_rows.append(compute_direct_pdet_selection_weight_diagnostics(posterior_median, "posterior_median", cosmic))
+        if n_diag_draws:
+            for j, idx in enumerate(idx_diag):
+                selection_diagnostic_rows.append(compute_direct_pdet_selection_weight_diagnostics(flat_samples[idx], f"posterior_draw_{j:03d}", cosmic))
+        print_selection_weight_diagnostics(selection_diagnostic_rows)
+    elif selection_mode == "lvk_farr" and K_np is not None and cosmic is not None:
         selection_diagnostic_rows.append(compute_selection_weight_diagnostics(
             posterior_median, "posterior_median", K_np, log_v, cosmic
         ))
@@ -2301,6 +2444,14 @@ def main():
         hyperprior_descriptions = np.array(HYPERPRIOR_DESCRIPTIONS, dtype=object),
         event_injection_support_bounds = np.array(EVENT_INJECTION_SUPPORT_BOUNDS, dtype=object),
         selection_mode   = selection_mode,
+        selection_uses_direct_pdet = selection_mode == "direct_pdet",
+        selection_uses_lvk_farr = selection_mode == "lvk_farr",
+        direct_pdet_requires_finite_pdet = selection_mode == "direct_pdet",
+        direct_pdet_positive_count = int(np.sum(cosmic.get("pdet") > 0.0)) if selection_mode == "direct_pdet" and cosmic is not None and cosmic.get("pdet") is not None else 0,
+        direct_pdet_finite_count = int(np.sum(np.isfinite(cosmic.get("pdet")))) if selection_mode == "direct_pdet" and cosmic is not None and cosmic.get("pdet") is not None else 0,
+        direct_pdet_mean_pdet_mergers = float(np.mean(cosmic.get("pdet"))) if selection_mode == "direct_pdet" and cosmic is not None and cosmic.get("pdet") is not None else np.nan,
+        injection_N_inj = int(cosmic.get("N_inj", 0)) if cosmic is not None else 0,
+        injection_N_merge = int(cosmic.get("N_merge", 0)) if cosmic is not None else 0,
         num_warmup       = opts.num_warmup,
         num_samples      = opts.num_samples,
         num_chains       = opts.num_chains,
@@ -2321,15 +2472,15 @@ def main():
         lvk_N_found_used = N_found_used,
         lvk_found_subsample_log_scaling = lvk_found_subsample_log_scale,
         allow_inconsistent_selection_model = opts.allow_inconsistent_selection_model,
-        selection_model_consistent = selection_model_consistent if selection_mode == "lvk_farr" else True,
-        selection_model_consistency_message = selection_model_consistency_message if selection_mode == "lvk_farr" else "Selection disabled; no injection metadata compared.",
+        selection_model_consistent = selection_model_consistent if selection_mode in {"lvk_farr", "direct_pdet"} else True,
+        selection_model_consistency_message = selection_model_consistency_message if selection_mode in {"lvk_farr", "direct_pdet"} else "Selection disabled; no injection metadata compared.",
         event_model_metadata = np.array(event_model_metadata, dtype=object),
-        injection_model_metadata = injection_model_metadata if selection_mode == "lvk_farr" else {},
-        injection_proposal_version = injection_model_metadata.get("proposal_version", "unknown") if selection_mode == "lvk_farr" else "not_used",
+        injection_model_metadata = injection_model_metadata if selection_mode in {"lvk_farr", "direct_pdet"} else {},
+        injection_proposal_version = injection_model_metadata.get("proposal_version", "unknown") if selection_mode in {"lvk_farr", "direct_pdet"} else "not_used",
         selection_consistency_checks = dict(
             allow_inconsistent_selection_model=bool(opts.allow_inconsistent_selection_model),
-            selection_model_consistent=bool(selection_model_consistent if selection_mode == "lvk_farr" else True),
-            message=selection_model_consistency_message if selection_mode == "lvk_farr" else "Selection disabled; no injection metadata compared.",
+            selection_model_consistent=bool(selection_model_consistent if selection_mode in {"lvk_farr", "direct_pdet"} else True),
+            message=selection_model_consistency_message if selection_mode in {"lvk_farr", "direct_pdet"} else "Selection disabled; no injection metadata compared.",
         ),
         lvk_sampling_pdf_validation_status = dict(
             verified=bool(lvk_sampling_pdf_metadata.get('verified', False)),
