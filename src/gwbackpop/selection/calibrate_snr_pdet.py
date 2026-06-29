@@ -1,4 +1,9 @@
-"""Lightweight diagnostic comparison for semi-analytic SNR-proxy pdet."""
+"""Threshold-scan diagnostic for semi-analytic SNR-proxy pdet.
+
+This utility currently computes only the SNR-proxy selection normalization.
+LVK/Farr comparison columns are emitted as NaN until Farr calibration is
+implemented here.
+"""
 from __future__ import annotations
 import argparse, csv, json
 import numpy as np
@@ -25,10 +30,11 @@ def log_alpha_snr_proxy(cosmic, lp_vec, pdet_callable):
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="Diagnostic SNR-proxy pdet alpha comparison/threshold scan.")
+    ap = argparse.ArgumentParser(description="Threshold-scan diagnostic for semi-analytic SNR-proxy pdet. LVK/Farr comparison columns are currently NaN until Farr calibration is implemented.")
     ap.add_argument("--injections_path", required=True)
     ap.add_argument("--hyperpoints_json", required=True)
     ap.add_argument("--output_csv", required=True)
+    ap.add_argument("--lvk_found_path", default=None, help="Reserved for future Farr calibration; currently accepted only to document that log_alpha_lvk_farr remains NaN.")
     ap.add_argument("--method", default="orientation_monte_carlo", choices=["hard_threshold", "orientation_monte_carlo", "logistic"])
     ap.add_argument("--rho_threshold", type=float, default=10.0)
     ap.add_argument("--sensitivity_scale", type=float, default=1.0)

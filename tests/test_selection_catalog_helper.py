@@ -57,3 +57,41 @@ def test_lvk_farr_reuses_shared_catalog_helper():
     lvk_part = src.split('elif selection_mode == "lvk_farr"', 1)[1]
     assert "load_cosmic_merger_catalog_for_selection" in lvk_part
     assert "log_pop_static_arr = np.zeros" not in lvk_part
+
+
+def test_catalog_helper_reports_missing_required_fields(tmp_path):
+    f = tmp_path / "missing_common.npz"
+    np.savez(f, theta=np.zeros((2, 1)))
+    with pytest.raises(ValueError, match="load_cosmic_merger_catalog_for_selection requires.*params.*lower_bound.*upper_bound.*N_inj.*N_merge"):
+        h.load_cosmic_merger_catalog_for_selection(str(f), [], True)
+
+
+def test_catalog_helper_requires_merger_observables_but_not_pdet(tmp_path):
+    f = tmp_path / "no_pdet.npz"
+    np.savez(
+        f,
+        theta=np.zeros((2, 1)),
+        params=np.array(["alpha_1"], dtype="U16"),
+        lower_bound=np.array([0.1]),
+        upper_bound=np.array([10.0]),
+        m1_src=np.array([30.0, 31.0]),
+        m2_src=np.array([20.0, 21.0]),
+        z_merger=np.array([0.1, 0.2]),
+        N_inj=np.array([5]),
+        N_merge=np.array([2]),
+    )
+    cosmic, *_ = h.load_cosmic_merger_catalog_for_selection(str(f), [], True)
+    assert cosmic["pdet"] is None
+
+    f_missing_obs = tmp_path / "missing_observables.npz"
+    np.savez(
+        f_missing_obs,
+        theta=np.zeros((2, 1)),
+        params=np.array(["alpha_1"], dtype="U16"),
+        lower_bound=np.array([0.1]),
+        upper_bound=np.array([10.0]),
+        N_inj=np.array([5]),
+        N_merge=np.array([2]),
+    )
+    with pytest.raises(ValueError, match="direct_pdet and LVK/Farr selection requires.*m1_src.*m2_src.*z_merger"):
+        h.load_cosmic_merger_catalog_for_selection(str(f_missing_obs), [], True)
