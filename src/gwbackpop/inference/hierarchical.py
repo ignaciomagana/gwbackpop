@@ -1597,9 +1597,36 @@ def _compute_log_pop_static_for_catalog(cosmic_raw, injection_model_metadata: di
     return log_pop_static
 
 
+def _require_npz_fields(cosmic_raw, required: list[str], context: str) -> None:
+    """Raise a clear error if an injection NPZ lacks required fields."""
+    missing = [name for name in required if name not in cosmic_raw]
+    if missing:
+        raise ValueError(
+            f"{context} requires injection catalog field(s): {', '.join(required)}; "
+            f"missing: {', '.join(missing)}"
+        )
+
+
 def load_cosmic_merger_catalog_for_selection(injections_path: str, event_model_metadata: list[dict], allow_inconsistent_selection_model: bool) -> tuple[dict, dict, bool, str]:
-    """Load COSMIC merger injection NPZ and shared proposal/static-pop accounting."""
+    """Load COSMIC merger injection NPZ and shared proposal/static-pop accounting.
+
+    The shared direct-pdet and LVK/Farr selection paths require COSMIC merger
+    hyperparameter samples and merger observables.  A direct-pdet catalog also
+    needs a valid ``pdet`` array, but that mode-specific validation is handled
+    separately by :func:`validate_direct_pdet_inputs` so LVK/Farr catalogs may
+    omit ``pdet`` or contain placeholder NaNs.
+    """
     cosmic_raw = np.load(injections_path, allow_pickle=True)
+    _require_npz_fields(
+        cosmic_raw,
+        ["theta", "params", "lower_bound", "upper_bound", "N_inj", "N_merge"],
+        "load_cosmic_merger_catalog_for_selection",
+    )
+    _require_npz_fields(
+        cosmic_raw,
+        ["m1_src", "m2_src", "z_merger"],
+        "direct_pdet and LVK/Farr selection",
+    )
     injection_model_metadata = dict(cosmic_raw["metadata"].item()) if "metadata" in cosmic_raw else {}
     injection_model_metadata.update({
         "likelihood_mode": _npz_scalar(cosmic_raw, "likelihood_mode", injection_model_metadata.get("likelihood_mode", "3D" if "z_form" in cosmic_raw else "2D")),
@@ -1624,7 +1651,7 @@ def load_cosmic_merger_catalog_for_selection(injections_path: str, event_model_m
             RuntimeWarning,
         )
         log_pop_static_arr = None
-    cosmic = dict(theta=cosmic_raw['theta'].astype(np.float64), m1_src=cosmic_raw['m1_src'].astype(np.float64) if 'm1_src' in cosmic_raw else np.array([]), m2_src=cosmic_raw['m2_src'].astype(np.float64) if 'm2_src' in cosmic_raw else np.array([]), z_merger=cosmic_raw['z_merger'].astype(np.float64) if 'z_merger' in cosmic_raw else np.array([]), pdet=cosmic_raw['pdet'].astype(np.float64) if 'pdet' in cosmic_raw else None, params=list(cosmic_raw['params']), lo=cosmic_raw['lower_bound'].astype(np.float64), hi=cosmic_raw['upper_bound'].astype(np.float64), N_inj=int(cosmic_raw['N_inj'].ravel()[0]), N_merge=int(cosmic_raw['N_merge'].ravel()[0]), kick_sigma=float(cosmic_raw['kick_proposal_sigma'].ravel()[0] if 'kick_proposal_sigma' in cosmic_raw else 50.0), log_q_proposal=log_q_arr, log_pop_static=log_pop_static_arr)
+    cosmic = dict(theta=cosmic_raw['theta'].astype(np.float64), m1_src=cosmic_raw['m1_src'].astype(np.float64), m2_src=cosmic_raw['m2_src'].astype(np.float64), z_merger=cosmic_raw['z_merger'].astype(np.float64), pdet=cosmic_raw['pdet'].astype(np.float64) if 'pdet' in cosmic_raw else None, params=list(cosmic_raw['params']), lo=cosmic_raw['lower_bound'].astype(np.float64), hi=cosmic_raw['upper_bound'].astype(np.float64), N_inj=int(cosmic_raw['N_inj'].ravel()[0]), N_merge=int(cosmic_raw['N_merge'].ravel()[0]), kick_sigma=float(cosmic_raw['kick_proposal_sigma'].ravel()[0] if 'kick_proposal_sigma' in cosmic_raw else 50.0), log_q_proposal=log_q_arr, log_pop_static=log_pop_static_arr)
     return cosmic, injection_model_metadata, selection_model_consistent, selection_model_consistency_message
 
 def lvk_found_subsample_log_scaling(N_found_total: int, N_found_used: int) -> float:

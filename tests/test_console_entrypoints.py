@@ -6,6 +6,7 @@ EXPECTED = {
     "gwbackpop-run-event": "gwbackpop.cli.run_backpop:main",
     "gwbackpop-run-injections": "gwbackpop.cli.run_injections:main",
     "gwbackpop-run-hierarchical": "gwbackpop.cli.run_hierarchical:main",
+    "gwbackpop-calibrate-snr-pdet": "gwbackpop.selection.calibrate_snr_pdet:main",
     "gwbackpop-plot": "gwbackpop.cli.plot_backpop:main",
     "gwbackpop-smoke-test": "gwbackpop.cli.smoke_test:main",
 }

@@ -23,7 +23,8 @@ jobs:
           gwbackpop-run-event --help
           gwbackpop-run-injections --help
           gwbackpop-run-hierarchical --help
+          gwbackpop-calibrate-snr-pdet --help
           gwbackpop-plot --help
           gwbackpop-smoke-test --help
       - name: Run lightweight tests
-        run: pytest tests/test_lightweight_infrastructure.py tests/test_truncated_population_densities.py tests/test_hierarchical_toy_recovery.py tests/test_selection_model_consistency.py tests/test_default_hyperparams.py tests/test_injection_proposal.py tests/test_cli_invocation_hygiene.py tests/test_console_entrypoints.py
+        run: pytest tests/test_lightweight_infrastructure.py tests/test_truncated_population_densities.py tests/test_hierarchical_toy_recovery.py tests/test_selection_model_consistency.py tests/test_default_hyperparams.py tests/test_injection_proposal.py tests/test_cli_invocation_hygiene.py tests/test_console_entrypoints.py tests/test_direct_pdet_selection.py tests/test_selection_catalog_helper.py tests/test_snr_pdet_proxy.py
