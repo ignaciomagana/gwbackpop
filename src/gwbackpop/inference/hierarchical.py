@@ -1,6 +1,6 @@
 """
-hierarchical_backpop_jax.py
-----------------------------
+Hierarchical BackPop inference
+------------------------------
 JAX/NumPyro implementation of the hierarchical BackPop population inference.
 
 Replaces the Nautilus nested sampler with NUTS (No-U-Turn Sampler) via NumPyro.
@@ -45,7 +45,7 @@ Key JAX design decisions
 
 Usage
 -----
-  python hierarchical_backpop_jax.py \\
+  gwbackpop-run-hierarchical \\
       --results_root   results/ \\
       --config_name    lucky_strikes \\
       --injections_path injections/gwtc3_cosmic_mergers.npz \\
@@ -56,7 +56,7 @@ Usage
       --num_chains     4
 
   # Without selection effects (biased, fast for testing):
-  python hierarchical_backpop_jax.py \\
+  gwbackpop-run-hierarchical \\
       --results_root  results/ \\
       --config_name   lucky_strikes \\
       --output_dir    results/hierarchical/lucky_strikes/nuts_no_sel

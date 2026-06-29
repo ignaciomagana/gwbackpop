@@ -1,6 +1,6 @@
 """
-run_backpop.py
---------------
+Single-event BackPop inference
+------------------------------
 Single-event BackPop inference with Nautilus nested sampling.
 
 Two likelihood modes, selectable via --use_redshift_likelihood:
@@ -21,13 +21,13 @@ Two likelihood modes, selectable via --use_redshift_likelihood:
 Usage
 -----
     # 2D (default):
-    python run_backpop.py \\
+    gwbackpop-run-event \\
         --samples_path /path/to/GW150914.h5 \\
         --event_name GW150914 \\
         --config_name lucky_strikes_fixed_vk1
 
     # 3D with cosmological prior:
-    python run_backpop.py \\
+    gwbackpop-run-event \\
         --samples_path /path/to/GW190814.h5 \\
         --event_name GW190814 \\
         --config_name lucky_strikes_zform \\

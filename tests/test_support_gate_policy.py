@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from run_backpop import _combined_support_gate_penalty, _support_gate_penalty
+from gwbackpop.inference.single_event import _combined_support_gate_penalty, _support_gate_penalty
 
 
 @pytest.mark.parametrize("value", [-1.0, 0.5, 2.0])

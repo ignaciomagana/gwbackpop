@@ -2,7 +2,7 @@
 
 BackPop connects gravitational-wave parameter-estimation results to binary-population physics.  It uses COSMIC binary evolution as a forward model for isolated binary black-hole (BBH) formation, compares the resulting merger observables to event-level gravitational-wave posteriors, and then combines multiple single-event results in a hierarchical population analysis.
 
-The repository currently contains three main workflows. The installed console commands are preferred; the old root-level Python wrappers remain temporarily available for backwards compatibility:
+The repository currently contains three main workflows. The installed console commands are the supported executable interface:
 
 | Workflow | Main entry point | Purpose | Status |
 |---|---|---|---|
@@ -16,14 +16,11 @@ Additional utilities:
 - `gwbackpop-plot` makes diagnostic figures from single-event output directories.
 - `workflows/shell/run_hierarchical_2d.sh`, `workflows/shell/run_hierarchical_3d.sh`, and `workflows/slurm/run_catalog_gwtc3.slurm` are convenience wrappers for catalog-scale analyses.
 
-Legacy root-level Python wrappers may remain temporarily for backwards compatibility, but documented workflows and CI use the installed console commands.
-
 
 ## Repository layout
 
 ```text
 src/gwbackpop/       installable package
-scripts/             backwards-compatible wrappers
 workflows/           shell and SLURM workflow drivers
 tests/               lightweight tests
 experimental/        research prototypes not imported by production code
