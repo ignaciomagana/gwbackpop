@@ -523,6 +523,7 @@ def run_campaign(
     snr_logistic_width: float = 1.0,
     snr_orientation_seed: int = 1234,
     snr_n_orientation: int = 200000,
+    debug_failures: bool = False,
 ) -> None:
     """Run the full injection campaign and save results.
 

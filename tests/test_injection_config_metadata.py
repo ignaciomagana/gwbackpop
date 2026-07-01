@@ -5,9 +5,12 @@ from gwbackpop.config import get_backpop_config
 
 
 class _FakePool:
+    initargs = ()
+
     def __init__(self, *args, **kwargs):
         init = kwargs.get("initializer")
         initargs = kwargs.get("initargs", ())
+        type(self).initargs = initargs
         if init is not None:
             init(*initargs)
 
@@ -60,3 +63,21 @@ def test_saved_injection_bounds_match_backpop_config(tmp_path, monkeypatch):
     assert bool(saved["uses_z_form"][0]) is False
     assert bool(saved["uses_sfr_prior"][0]) is False
     assert bool(saved["uses_logZ_given_z_prior"][0]) is False
+
+
+def test_run_campaign_accepts_debug_failures(tmp_path, monkeypatch):
+    _FakePool.initargs = ()
+    monkeypatch.setattr(run_injections, "Pool", _FakePool)
+    output_path = tmp_path / "injections.npz"
+
+    run_injections.run_campaign(
+        pdet_path=None,
+        output_path=str(output_path),
+        n_inj=1,
+        n_workers=1,
+        config_name="lucky_strikes",
+        debug_failures=True,
+    )
+
+    assert run_injections.DEBUG_FAILURES is True
+    assert _FakePool.initargs[-1] is True
