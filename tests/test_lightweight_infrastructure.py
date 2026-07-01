@@ -80,3 +80,34 @@ def test_toy_hierarchical_likelihood_prefers_matching_population():
     good = hb.jnp.array(good_np, dtype=hb.jnp.float64)
     bad = hb.jnp.array(bad_np, dtype=hb.jnp.float64)
     assert float(ll(good)) > float(ll(bad))
+
+
+def test_numpyro_model_applies_positive_floors_and_packs_population_order():
+    numpyro = pytest.importorskip("numpyro")
+    captured = []
+
+    def log_likelihood_fn(lp_vec):
+        captured.append(np.asarray(lp_vec, dtype=float))
+        return hb.jnp.array(0.0, dtype=hb.jnp.float64)
+
+    floors = dict(sig_logalpha_floor=0.05, sigma_v_floor=5.0, beta_shape_floor=0.05)
+    model = hb.make_numpyro_model(log_likelihood_fn, **floors)
+    seeded = numpyro.handlers.seed(model, hb.jax.random.PRNGKey(123))
+    trace = numpyro.handlers.trace(seeded).get_trace()
+
+    assert captured, "model should evaluate the likelihood with a packed lp_vec"
+    packed = captured[-1]
+    deterministic_values = np.array([np.asarray(trace[name]["value"], dtype=float) for name in hb.POP_PARAM_NAMES])
+    np.testing.assert_allclose(packed, deterministic_values)
+
+    assert float(trace["sig_logalpha1"]["value"]) >= floors["sig_logalpha_floor"]
+    assert float(trace["sig_logalpha2"]["value"]) >= floors["sig_logalpha_floor"]
+    assert float(trace["sigma_v1"]["value"]) >= floors["sigma_v_floor"]
+    assert float(trace["sigma_v2"]["value"]) >= floors["sigma_v_floor"]
+    for name in ("a_f1", "b_f1", "a_f2", "b_f2"):
+        assert float(trace[name]["value"]) >= floors["beta_shape_floor"]
+        assert f"{name}_raw" in trace
+    assert "sig_logalpha1_raw" in trace
+    assert "sig_logalpha2_raw" in trace
+    assert "sigma_v1_raw" in trace
+    assert "sigma_v2_raw" in trace
