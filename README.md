@@ -414,6 +414,16 @@ BackPop uses finite prior bounds for several event and injection parameters and 
 
 No-selection hierarchical runs, direct-`pdet` runs with invalid or inconsistent pdet catalogs, small injection campaigns, heavily subsampled LVK found-injection matrices, and intentionally inconsistent 2D/3D combinations are diagnostics. They can be valuable for debugging but should not be presented as final astrophysical population constraints.
 
+### Troubleshooting zero-merger injection campaigns
+
+If `gwbackpop-run-injections` reports `N_merge=0`, first rerun a small catalog with `--debug_failures True` to separate ordinary non-mergers from COSMIC runtime exceptions and print example tracebacks:
+
+```bash
+gwbackpop-run-injections --output_path injections/debug.npz --n_inj 100 --n_workers 1 --debug_failures True
+```
+
+Then run the direct COSMIC/evolv2 smoke test (`gwbackpop-smoke-test` without `--skip-cosmic`) to verify that the installed COSMIC backend can evolve the bundled BBH test binary. Some COSMIC builds do not expose `_evolvebin.se_flags`; gwbackpop now treats those SSE/METISSE toggles as optional and continues without them, while builds that do expose `se_flags` still receive `using_metisse=0` and `using_sse=1`.
+
 ## Environment setup and lightweight tests
 
 This repository includes a `pyproject.toml` for reproducible Python dependency setup.  A typical fresh checkout can be prepared with:

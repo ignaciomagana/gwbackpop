@@ -207,3 +207,75 @@ def test_likelihood_3d_accepts_config_logz_support(monkeypatch):
             fixed_params={},
             logZ_support=(0.0, -4.0),
         )
+
+
+def test_set_evolvebin_flags_allows_missing_se_flags(monkeypatch):
+    import importlib
+    import sys
+    import types
+
+    fake_cosmic = types.ModuleType("cosmic")
+    fake_evolvebin = types.SimpleNamespace()
+    for name in [
+        "windvars", "cevars", "ceflags", "flags", "snvars", "points",
+        "mtvars", "magvars", "tidalvars", "rand1", "mixvars", "metvars",
+    ]:
+        setattr(fake_evolvebin, name, types.SimpleNamespace())
+    fake_cosmic._evolvebin = fake_evolvebin
+    monkeypatch.setitem(sys.modules, "cosmic", fake_cosmic)
+    sys.modules.pop("gwbackpop.evolution.cosmic", None)
+    cosmic_mod = importlib.import_module("gwbackpop.evolution.cosmic")
+
+    flag_names = [
+        'ST_cr', 'ST_tide', 'acc2', 'acc_lim', 'aic', 'alpha1', 'bconst',
+        'bdecayfac', 'beta', 'bhflag', 'bhms_coll_flag', 'bhsigmafrac',
+        'bhspinflag', 'bhspinmag', 'bwind', 'ceflag', 'cehestarflag',
+        'cekickflag', 'cemergeflag', 'ck', 'don_lim', 'ecsn', 'ecsn_mlow',
+        'eddfac', 'eddlimflag', 'epsnov', 'fprimc_array', 'gamma', 'grflag',
+        'hewind', 'htpmb', 'ifflag', 'kickflag', 'lambdaf', 'mxns',
+        'natal_kick_array', 'neta', 'pisn', 'polar_kick_angle', 'pts1',
+        'pts2', 'pts3', 'qcflag', 'qcrit_array', 'randomseed', 'rejuv_fac',
+        'rejuvflag', 'rembar_massloss', 'remnantflag', 'rtmsflag', 'sigma',
+        'sigmadiv', 'tflag', 'ussn', 'wdflag', 'windflag', 'xi', 'zsun',
+    ]
+    flags = {name: 1.0 for name in flag_names}
+    flags["alpha1"] = np.array([1.0, 1.0])
+    flags["acc_lim"] = np.array([0.5, 0.5])
+    flags["natal_kick_array"] = np.zeros((2, 5))
+    flags["qcrit_array"] = np.ones(16)
+    flags["fprimc_array"] = np.ones(16)
+
+    with pytest.warns(RuntimeWarning, match="lacks se_flags"):
+        cosmic_mod.set_evolvebin_flags(flags)
+    cosmic_mod.set_evolvebin_flags(flags)
+
+
+def test_run_one_debug_reports_cosmic_exception(monkeypatch):
+    import importlib
+    import sys
+    import types
+
+    fake_cosmic = types.ModuleType("cosmic")
+    fake_cosmic._evolvebin = types.SimpleNamespace()
+    monkeypatch.setitem(sys.modules, "cosmic", fake_cosmic)
+    sys.modules.pop("gwbackpop.evolution.cosmic", None)
+
+    import gwbackpop.selection.injections as inj
+    cosmic_mod = importlib.import_module("gwbackpop.evolution.cosmic")
+
+    monkeypatch.setattr(inj, "DEBUG_FAILURES", True)
+    monkeypatch.setattr(inj, "LOWER", np.array([10.0, 0.5]))
+    monkeypatch.setattr(inj, "UPPER", np.array([20.0, 1.0]))
+    monkeypatch.setattr(inj, "PARAMS", ["m1", "q"])
+    monkeypatch.setattr(inj, "FIXED_PARAMS", {})
+    monkeypatch.setattr(inj, "LIKELIHOOD_MODE", "2D")
+    monkeypatch.setattr(inj, "_PDET", None, raising=False)
+    monkeypatch.setattr(inj, "_draw_z_form", lambda rng: 1.0)
+    monkeypatch.setattr(inj, "compute_log_q_proposal", lambda *args, **kwargs: 0.0)
+    monkeypatch.setattr(cosmic_mod, "evolv2", lambda *args, **kwargs: (_ for _ in ()).throw(AttributeError("boom")))
+
+    result = inj._run_one(123)
+
+    assert result["ok"] is False
+    assert result["reason"] == "cosmic_exception"
+    assert "AttributeError" in result["message"]
