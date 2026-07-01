@@ -640,12 +640,31 @@ def evolv2(
     set_evolvebin_flags(flags)
 
     # ---- Column index arrays for bpp / bcm output ----
-    col_inds_bpp = np.zeros(len(ALL_COLUMNS), dtype=int)
-    col_inds_bpp[:len(BPP_COLUMNS)] = [ALL_COLUMNS.index(c) + 1 for c in BPP_COLUMNS]
+    def _make_col_inds(columns, existing_array, label):
+        # COSMIC Fortran ABI differs across cosmic-popsynth builds.
+        # Size col_inds_* from the live Fortran object, not len(ALL_COLUMNS).
+        try:
+            existing = np.asarray(existing_array)
+            n_slots = int(existing.shape[0])
+            dtype = existing.dtype
+        except Exception:
+            n_slots = len(ALL_COLUMNS)
+            dtype = np.int32
+
+        if n_slots < len(columns):
+            raise ValueError(
+                f"COSMIC {label} col_inds has {n_slots} slots but "
+                f"{len(columns)} columns were requested."
+            )
+
+        out = np.zeros(n_slots, dtype=dtype)
+        out[:len(columns)] = [ALL_COLUMNS.index(c) + 1 for c in columns]
+        return out
+
+    col_inds_bpp = _make_col_inds(BPP_COLUMNS, _evolvebin.col.col_inds_bpp, "bpp")
     n_col_bpp = len(BPP_COLUMNS)
 
-    col_inds_bcm = np.zeros(len(ALL_COLUMNS), dtype=int)
-    col_inds_bcm[:len(BCM_COLUMNS)] = [ALL_COLUMNS.index(c) + 1 for c in BCM_COLUMNS]
+    col_inds_bcm = _make_col_inds(BCM_COLUMNS, _evolvebin.col.col_inds_bcm, "bcm")
     n_col_bcm = len(BCM_COLUMNS)
 
     _evolvebin.col.n_col_bpp    = n_col_bpp
@@ -678,12 +697,49 @@ def evolv2(
     kick_info = np.zeros((2, 18))
 
     # ---- Call COSMIC Fortran kernel ----
-    [_, bpp_index, bcm_index, kick_info_arrays] = _evolvebin.evolv2(
+    # COSMIC ABI differs across cosmic-popsynth builds.
+    # Known variants:
+    #   4-return: (_, bpp_index, bcm_index, kick_info_arrays)
+    #   3-return: (bpp_index, bcm_index, kick_info_arrays)
+    #   3-return older fallback: (_, bpp_index, bcm_index), with kick_info filled in-place.
+    evolv2_out = _evolvebin.evolv2(
         kstar, mass, tb, e, metallicity, tphysf,
         dtp, mass0, rad, lumin, massc, radc,
         menv, renv, ospin, B_0, bacc, tacc, epoch, tms,
         bhspin, tphys, zpars, bkick, kick_info,
     )
+
+    def _scalar_int(x, name):
+        arr = np.asarray(x)
+        if arr.shape == ():
+            return int(arr)
+        if arr.size == 1:
+            return int(arr.ravel()[0])
+        raise TypeError(
+            f"COSMIC returned non-scalar {name}: "
+            f"shape={arr.shape}, dtype={arr.dtype}"
+        )
+
+    if len(evolv2_out) == 4:
+        _, bpp_index, bcm_index, kick_info_arrays = evolv2_out
+    elif len(evolv2_out) == 3:
+        a, b, c = evolv2_out
+        # Most COSMIC 3.x builds return (bpp_index, bcm_index, kick_info_arrays).
+        # If that is not true, fall back to (_, bpp_index, bcm_index).
+        try:
+            bpp_index = _scalar_int(a, "bpp_index")
+            bcm_index = _scalar_int(b, "bcm_index")
+            kick_info_arrays = c
+        except TypeError:
+            _, bpp_index, bcm_index = evolv2_out
+            kick_info_arrays = kick_info
+    else:
+        raise RuntimeError(
+            f"Unexpected COSMIC evolv2 return length: {len(evolv2_out)}"
+        )
+
+    bpp_index = _scalar_int(bpp_index, "bpp_index")
+    bcm_index = _scalar_int(bcm_index, "bcm_index")
 
     # ---- Extract and clear output arrays (avoids Fortran global state leakage) ----
     bpp_raw = _evolvebin.binary.bpp[:25, :n_col_bpp].copy()

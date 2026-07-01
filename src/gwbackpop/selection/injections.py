@@ -383,7 +383,7 @@ def _log_q_z_form(z_form: float) -> float:
         _prior_weight_grid[mask],
         np.array([np.interp(ZFORM_MAX, _zgrid, _prior_weight_grid)]),
     ])
-    norm = np.trapezoid(w_norm_grid, z_norm_grid)
+    norm = np.trapz(w_norm_grid, z_norm_grid)
     weight = np.interp(z_form, _zgrid, _prior_weight_grid, left=0.0, right=0.0)
     return float(np.log(weight) - np.log(norm)) if weight > 0.0 and norm > 0.0 else -np.inf
 

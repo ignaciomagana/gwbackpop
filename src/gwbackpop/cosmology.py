@@ -139,7 +139,7 @@ _dVc_dz_grid = _DC_grid**2 * _c_km_s / _H_grid          # Mpc^3 per unit z (up t
 _prior_weight_grid = _dVc_dz_grid * _sfr_grid / (1.0 + _zgrid)
 
 # Normalise to a proper PDF over [Z_FORM_MIN, Z_FORM_MAX]
-_prior_norm = np.trapezoid(_prior_weight_grid, _zgrid)
+_prior_norm = np.trapz(_prior_weight_grid, _zgrid)
 _log_prior_norm = np.log(_prior_norm)
 
 # Build interpolators (log-space for smoothness where values span orders of magnitude)
