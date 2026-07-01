@@ -58,6 +58,17 @@ from astropy import constants
 from cosmic import _evolvebin
 
 
+_SE_FLAGS_MISSING_WARNED = False
+
+
+def _set_optional_attr(obj, attr: str, value, context: str) -> bool:
+    """Set obj.attr when present; return whether an assignment was made."""
+    if not hasattr(obj, attr):
+        return False
+    setattr(obj, attr, value)
+    return True
+
+
 _SOURCE_MASS_ALIASES = (
     ("mass_1_source", "mass_2_source"),
     ("mass1_source", "mass2_source"),
@@ -563,8 +574,18 @@ def set_evolvebin_flags(flags: dict) -> None:
     _evolvebin.snvars.rembar_massloss  = flags["rembar_massloss"]
     _evolvebin.metvars.zsun            = flags["zsun"]
     _evolvebin.snvars.kickflag         = flags["kickflag"]
-    _evolvebin.se_flags.using_metisse  = 0
-    _evolvebin.se_flags.using_sse      = 1
+
+    global _SE_FLAGS_MISSING_WARNED
+    if hasattr(_evolvebin, "se_flags"):
+        _set_optional_attr(_evolvebin.se_flags, "using_metisse", 0, "_evolvebin.se_flags")
+        _set_optional_attr(_evolvebin.se_flags, "using_sse", 1, "_evolvebin.se_flags")
+    elif not _SE_FLAGS_MISSING_WARNED:
+        warnings.warn(
+            "COSMIC _evolvebin build lacks se_flags; continuing without "
+            "explicit SSE/METISSE toggles.",
+            RuntimeWarning, stacklevel=2,
+        )
+        _SE_FLAGS_MISSING_WARNED = True
 
 
 # ---------------------------------------------------------------------------

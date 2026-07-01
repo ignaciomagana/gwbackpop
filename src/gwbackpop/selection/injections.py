@@ -64,8 +64,10 @@ import sys
 import time
 import pickle
 import warnings
+import traceback
+from collections import Counter
 import numpy as np
-from argparse import ArgumentParser
+from argparse import ArgumentParser, ArgumentTypeError
 from multiprocessing import Pool, cpu_count
 from scipy.stats import maxwell
 from gwbackpop.metadata import base_runtime_metadata, get_package_versions, save_metadata
@@ -112,20 +114,23 @@ LOGZ_HI = np.log10(0.03)
 
 # z_form drawn from SFR prior; upper limit where SFR is negligible
 ZFORM_MAX = 20.0
+DEBUG_FAILURES = False
+MAX_DEBUG_EXAMPLES = 5
 
 
 # ---------------------------------------------------------------------------
 # Worker function (runs in subprocess — must be importable at module level)
 # ---------------------------------------------------------------------------
 
-def _worker_init(pdet_path: str | None, config_name: str = DEFAULT_CONFIG_NAME, likelihood_mode: str = "2D", pdet_callable=None) -> None:
+def _worker_init(pdet_path: str | None, config_name: str = DEFAULT_CONFIG_NAME, likelihood_mode: str = "2D", pdet_callable=None, debug_failures: bool = False) -> None:
     """Load P_det interpolator once per worker process.
     If pdet_path is None, P_det evaluation is skipped and pdet=nan is stored.
     Use this mode when building the COSMIC merger catalog for LVKInjectionCampaign.
     """
-    global _PDET, LOWER, UPPER, PARAMS, FIXED_PARAMS, LIKELIHOOD_MODE
+    global _PDET, LOWER, UPPER, PARAMS, FIXED_PARAMS, LIKELIHOOD_MODE, DEBUG_FAILURES
     LOWER, UPPER, PARAMS, FIXED_PARAMS = _load_config(config_name)
     LIKELIHOOD_MODE = str(likelihood_mode).upper()
+    DEBUG_FAILURES = bool(debug_failures)
     if pdet_callable is not None:
         _PDET = pdet_callable
         return
@@ -134,6 +139,14 @@ def _worker_init(pdet_path: str | None, config_name: str = DEFAULT_CONFIG_NAME, 
         return
     with open(pdet_path, 'rb') as f:
         _PDET = pickle.load(f)
+
+
+def _failure(reason: str, **extra) -> dict | None:
+    if not DEBUG_FAILURES:
+        return None
+    out = {"ok": False, "reason": reason}
+    out.update(extra)
+    return out
 
 
 def _run_one(seed: int) -> dict | None:
@@ -179,14 +192,14 @@ def _run_one(seed: int) -> dict | None:
     # 3D selection uses the physical SFR and P(logZ | z_form) priors.
     z_form = _draw_z_form(rng)
     if z_form is None:
-        return None
+        return _failure("invalid_z_form")
 
     if LIKELIHOOD_MODE == "2D":
         log10_Z = float(rng.uniform(LOGZ_LO, LOGZ_HI))
     elif LIKELIHOOD_MODE == "3D":
         log10_Z = _draw_logZ_given_z(rng, z_form)
         if log10_Z is None:
-            return None
+            return _failure("invalid_logZ")
     else:
         raise ValueError(f"Unknown LIKELIHOOD_MODE={LIKELIHOOD_MODE!r}")
 
@@ -198,7 +211,7 @@ def _run_one(seed: int) -> dict | None:
 
     log_q_proposal = compute_log_q_proposal(theta, z_form, log10_Z, KICK_PROPOSAL_SIGMA)
     if not np.isfinite(log_q_proposal):
-        return None
+        return _failure("invalid_log_q_proposal")
 
     # ---- Run COSMIC ----
     try:
@@ -206,11 +219,15 @@ def _run_one(seed: int) -> dict | None:
         final_state, bpp_raw, _ = evolv2(
             params_dict, ['mass_1', 'mass_2'], fixed_params=FIXED_PARAMS
         )
-    except Exception:
-        return None
+    except Exception as exc:
+        return _failure(
+            "cosmic_exception",
+            message=repr(exc),
+            traceback="".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
+        )
 
     if final_state is None:
-        return None   # no BBH merger within Hubble time
+        return _failure("no_bbh_merger")   # no BBH merger within Hubble time
 
     m1_src = float(final_state['mass_1'])
     m2_src = float(final_state['mass_2'])
@@ -228,12 +245,12 @@ def _run_one(seed: int) -> dict | None:
         (bpp.kstar_1 == 14) & (bpp.kstar_2 == 14) & (bpp.evol_type == 3)
     ]
     if len(merger_rows) == 0:
-        return None
+        return _failure("no_bbh_merger")
     t_delay = float(merger_rows['tphys'].iloc[0])   # Myr
 
     z_merger = z_merger_from_t_delay(z_form, t_delay)
     if z_merger is None:
-        return None   # merges in future or before formation
+        return _failure("invalid_z_merger")   # merges in future or before formation
 
     # ---- P_det(m1_src, m2_src, z_merger) ----
     # If _PDET is None (LVK raw-injection mode), store nan — pdet is evaluated
@@ -244,8 +261,8 @@ def _run_one(seed: int) -> dict | None:
         try:
             pdet = float(_PDET(m1_src, m2_src, z_merger))
             pdet = float(np.clip(pdet, 0.0, 1.0))
-        except Exception:
-            return None
+        except Exception as exc:
+            return _failure("pdet_exception", message=repr(exc))
 
     return dict(
         theta      = theta,
@@ -257,6 +274,7 @@ def _run_one(seed: int) -> dict | None:
         t_delay    = t_delay,
         pdet       = pdet,
         log_q_proposal = log_q_proposal,
+        ok=True,
     )
 
 
@@ -522,9 +540,10 @@ def run_campaign(
         Seeds per Pool.map call — balances overhead vs memory.
     """
     config_name = config_name or DEFAULT_CONFIG_NAME
-    global LOWER, UPPER, PARAMS, FIXED_PARAMS, LIKELIHOOD_MODE
+    global LOWER, UPPER, PARAMS, FIXED_PARAMS, LIKELIHOOD_MODE, DEBUG_FAILURES
     LOWER, UPPER, PARAMS, FIXED_PARAMS = _load_config(config_name)
     LIKELIHOOD_MODE = str(likelihood_mode).upper()
+    DEBUG_FAILURES = bool(debug_failures)
     if LIKELIHOOD_MODE not in {"2D", "3D"}:
         raise ValueError("likelihood_mode must be 2D or 3D")
 
@@ -542,6 +561,8 @@ def run_campaign(
     seeds = np.arange(n_inj, dtype=np.int64)
 
     results = []
+    failures = Counter()
+    failure_examples = []
     n_done  = 0
 
     print(f"[injections] n_inj={n_inj:,}  n_workers={n_workers}")
@@ -558,12 +579,21 @@ def run_campaign(
     with Pool(
         processes=n_workers,
         initializer=_worker_init,
-        initargs=(pdet_path_resolved, config_name, LIKELIHOOD_MODE, pdet_callable),
+        initargs=(pdet_path_resolved, config_name, LIKELIHOOD_MODE, pdet_callable, debug_failures),
     ) as pool:
         for i in range(0, n_inj, chunk_size):
             batch = seeds[i : i + chunk_size]
             batch_results = pool.map(_run_one, batch)
-            results.extend([r for r in batch_results if r is not None])
+            for r in batch_results:
+                if r is None:
+                    continue
+                if r.get("ok", True):
+                    results.append(r)
+                else:
+                    reason = str(r.get("reason", "unknown_failure"))
+                    failures[reason] += 1
+                    if len(failure_examples) < MAX_DEBUG_EXAMPLES:
+                        failure_examples.append(r)
             n_done += len(batch)
 
             if n_done % max(chunk_size * 20, 10_000) == 0 or n_done == n_inj:
@@ -579,6 +609,21 @@ def run_campaign(
                     f"<Pdet>={pdet_mean:.3f}  "
                     f"elapsed={elapsed/60:.1f}min  ETA={eta/60:.1f}min"
                 )
+
+    if debug_failures:
+        print()
+        print("[injections] Failure histogram:")
+        if failures:
+            for reason, count in failures.most_common():
+                print(f"  {reason:>24s}: {count:,}")
+        else:
+            print("  (no rejected injections recorded)")
+        for idx, failure in enumerate(failure_examples, start=1):
+            print(f"[injections] Failure example {idx}: {failure.get('reason')}")
+            if failure.get("message"):
+                print(f"  message: {failure['message']}")
+            if failure.get("traceback"):
+                print(failure["traceback"].rstrip())
 
     n_merge = len(results)
     if n_merge == 0:
@@ -708,6 +753,17 @@ def run_campaign(
 # CLI
 # ---------------------------------------------------------------------------
 
+def _str_to_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    lowered = str(value).lower()
+    if lowered in ("true", "t", "1", "yes", "y"):
+        return True
+    if lowered in ("false", "f", "0", "no", "n"):
+        return False
+    raise ArgumentTypeError(f"Expected a boolean value, got {value!r}")
+
+
 def parse_args():
     p = ArgumentParser(description="BackPop injection campaign for selection effects.")
     p.add_argument("--pdet_path",   default=None,
@@ -733,6 +789,8 @@ def parse_args():
                    help="Seeds per pool.map call (default 500).")
     p.add_argument("--dry_run",     type=str, default='False',
                    help="If True, run n_inj=10000 to estimate merger fraction only.")
+    p.add_argument("--debug_failures", type=_str_to_bool, default=False,
+                   help="If True, record and print rejection reasons and COSMIC exception tracebacks.")
     p.add_argument("--config_name", default=DEFAULT_CONFIG_NAME,
                    help="BackPop config name whose params/bounds are used for injections (default: lucky_strikes).")
     p.add_argument("--likelihood_mode", choices=["2D", "3D"], default="2D",
@@ -743,6 +801,7 @@ def parse_args():
 def main():
     opts = parse_args()
     dry  = opts.dry_run.lower() in ('true', 't', '1', 'yes')
+    debug_failures = bool(opts.debug_failures)
     n    = 10_000 if dry else opts.n_inj
     nw   = opts.n_workers or cpu_count()
 
@@ -767,6 +826,7 @@ def main():
         snr_logistic_width = opts.snr_logistic_width,
         snr_orientation_seed = opts.snr_orientation_seed,
         snr_n_orientation = opts.snr_n_orientation,
+        debug_failures = debug_failures,
     )
 
 
