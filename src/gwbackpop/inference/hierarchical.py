@@ -132,19 +132,25 @@ def str2bool(value):
 
 HYPERPARAM_INFO = [
     dict(name="mu_logalpha1",  default=0.0,   prior="Normal(0.0, 1.5)"),
-    dict(name="sig_logalpha1", default=0.7,   prior="Exponential(1.0)"),
+    dict(name="sig_logalpha1", default=0.7,   prior="0.05 + Exponential(1.0)"),
     dict(name="mu_logalpha2",  default=0.0,   prior="Normal(0.0, 1.5)"),
-    dict(name="sig_logalpha2", default=0.7,   prior="Exponential(1.0)"),
-    dict(name="a_f1",          default=2.0,   prior="Gamma(2.0, 1.0)"),
-    dict(name="b_f1",          default=2.0,   prior="Gamma(2.0, 1.0)"),
-    dict(name="a_f2",          default=2.0,   prior="Gamma(2.0, 1.0)"),
-    dict(name="b_f2",          default=2.0,   prior="Gamma(2.0, 1.0)"),
-    dict(name="sigma_v1",      default=150.0, prior="HalfNormal(150.0)"),
-    dict(name="sigma_v2",      default=150.0, prior="HalfNormal(150.0)"),
+    dict(name="sig_logalpha2", default=0.7,   prior="0.05 + Exponential(1.0)"),
+    dict(name="a_f1",          default=2.0,   prior="0.05 + Gamma(2.0, 1.0)"),
+    dict(name="b_f1",          default=2.0,   prior="0.05 + Gamma(2.0, 1.0)"),
+    dict(name="a_f2",          default=2.0,   prior="0.05 + Gamma(2.0, 1.0)"),
+    dict(name="b_f2",          default=2.0,   prior="0.05 + Gamma(2.0, 1.0)"),
+    dict(name="sigma_v1",      default=150.0, prior="5.0 + HalfNormal(150.0)"),
+    dict(name="sigma_v2",      default=150.0, prior="5.0 + HalfNormal(150.0)"),
 ]
 
 POP_PARAM_NAMES = [p["name"] for p in HYPERPARAM_INFO]
 HYPERPRIOR_DESCRIPTIONS = {p["name"]: p["prior"] for p in HYPERPARAM_INFO}
+
+# Conservative positive floors used inside the NumPyro model to keep scale
+# and Beta-shape parameters away from zero-boundary funnel/pathology regions.
+DEFAULT_SIG_LOGALPHA_FLOOR = 0.05
+DEFAULT_SIGMA_V_FLOOR = 5.0
+DEFAULT_BETA_SHAPE_FLOOR = 0.05
 
 # Physical support for event/injection variables.  These are supports of the
 # population density factors and single-event/injection proposals, not support
@@ -828,7 +834,12 @@ def make_hierarchical_log_likelihood(
 # NumPyro model
 # ---------------------------------------------------------------------------
 
-def make_numpyro_model(log_likelihood_fn: callable) -> callable:
+def make_numpyro_model(
+    log_likelihood_fn: callable,
+    sig_logalpha_floor: float = DEFAULT_SIG_LOGALPHA_FLOOR,
+    sigma_v_floor: float = DEFAULT_SIGMA_V_FLOOR,
+    beta_shape_floor: float = DEFAULT_BETA_SHAPE_FLOOR,
+) -> callable:
     """Wrap the hierarchical log-likelihood as a NumPyro model.
 
     The population hyperparameters use explicit, weakly informative priors
@@ -843,41 +854,50 @@ def make_numpyro_model(log_likelihood_fn: callable) -> callable:
             "mu_logalpha1",
             dist.Normal(0.0, 1.5),
         )
-        params["sig_logalpha1"] = numpyro.sample(
-            "sig_logalpha1",
+        sig_logalpha1_raw = numpyro.sample(
+            "sig_logalpha1_raw",
             dist.Exponential(1.0),
+        )
+        params["sig_logalpha1"] = numpyro.deterministic(
+            "sig_logalpha1",
+            sig_logalpha_floor + sig_logalpha1_raw,
         )
         params["mu_logalpha2"] = numpyro.sample(
             "mu_logalpha2",
             dist.Normal(0.0, 1.5),
         )
-        params["sig_logalpha2"] = numpyro.sample(
-            "sig_logalpha2",
+        sig_logalpha2_raw = numpyro.sample(
+            "sig_logalpha2_raw",
             dist.Exponential(1.0),
         )
-        params["a_f1"] = numpyro.sample(
-            "a_f1",
-            dist.Gamma(2.0, 1.0),
+        params["sig_logalpha2"] = numpyro.deterministic(
+            "sig_logalpha2",
+            sig_logalpha_floor + sig_logalpha2_raw,
         )
-        params["b_f1"] = numpyro.sample(
-            "b_f1",
-            dist.Gamma(2.0, 1.0),
+        for name in ("a_f1", "b_f1", "a_f2", "b_f2"):
+            raw = numpyro.sample(
+                f"{name}_raw",
+                dist.Gamma(2.0, 1.0),
+            )
+            params[name] = numpyro.deterministic(
+                name,
+                beta_shape_floor + raw,
+            )
+        sigma_v1_raw = numpyro.sample(
+            "sigma_v1_raw",
+            dist.HalfNormal(150.0),
         )
-        params["a_f2"] = numpyro.sample(
-            "a_f2",
-            dist.Gamma(2.0, 1.0),
-        )
-        params["b_f2"] = numpyro.sample(
-            "b_f2",
-            dist.Gamma(2.0, 1.0),
-        )
-        params["sigma_v1"] = numpyro.sample(
+        params["sigma_v1"] = numpyro.deterministic(
             "sigma_v1",
+            sigma_v_floor + sigma_v1_raw,
+        )
+        sigma_v2_raw = numpyro.sample(
+            "sigma_v2_raw",
             dist.HalfNormal(150.0),
         )
-        params["sigma_v2"] = numpyro.sample(
+        params["sigma_v2"] = numpyro.deterministic(
             "sigma_v2",
-            dist.HalfNormal(150.0),
+            sigma_v_floor + sigma_v2_raw,
         )
 
         # Pack into a single vector for the JIT-compiled likelihood
@@ -1513,6 +1533,14 @@ def parse_args():
     sel.add_argument("--allow_inconsistent_selection_model", type=str2bool, default=False,
                      help="Explicitly allow event posterior and injection metadata to use different base measures. Intended only for legacy diagnostics.")
 
+    stab = p.add_argument_group("NumPyro stabilization")
+    stab.add_argument("--sig_logalpha_floor", type=float, default=DEFAULT_SIG_LOGALPHA_FLOOR,
+                      help="Additive floor for log-alpha scale hyperparameters.")
+    stab.add_argument("--sigma_v_floor", type=float, default=DEFAULT_SIGMA_V_FLOOR,
+                      help="Additive floor for natal-kick Maxwell scale hyperparameters [km/s].")
+    stab.add_argument("--beta_shape_floor", type=float, default=DEFAULT_BETA_SHAPE_FLOOR,
+                      help="Additive floor for beta shape hyperparameters a_f*/b_f*.")
+
     return p.parse_args()
 
 
@@ -1896,7 +1924,12 @@ def main():
         )
         print(f"  Selection diagnostics CSV: {selection_diag_path}")
 
-    model = make_numpyro_model(log_likelihood_fn)
+    model = make_numpyro_model(
+        log_likelihood_fn,
+        sig_logalpha_floor=opts.sig_logalpha_floor,
+        sigma_v_floor=opts.sigma_v_floor,
+        beta_shape_floor=opts.beta_shape_floor,
+    )
 
     # ---- NUTS sampling ----
     print(f"\n Running NUTS: {opts.num_chains} chains × "
@@ -1921,8 +1954,8 @@ def main():
     samples_dict = mcmc.get_samples(group_by_chain=True)
     # samples_dict: {param: (n_chains, n_samples)} arrays
 
-    print("\n Posterior summary:")
-    mcmc.print_summary(prob=0.9)
+    print("\n Posterior summary (population parameters; raw floor-offset sites omitted):")
+    print_summary({k: samples_dict[k] for k in POP_PARAM_NAMES if k in samples_dict}, prob=0.9)
 
     # ---- Convergence diagnostics ----
     # R-hat requires >= 2 chains. Guard gracefully for single-chain runs.
@@ -2483,6 +2516,9 @@ def main():
         num_chains       = opts.num_chains,
         r_hats           = [r_hats.get(k, np.nan) for k in POP_PARAM_NAMES],
         n_effs           = [n_effs.get(k, np.nan)  for k in POP_PARAM_NAMES],
+        sig_logalpha_floor = opts.sig_logalpha_floor,
+        sigma_v_floor = opts.sigma_v_floor,
+        beta_shape_floor = opts.beta_shape_floor,
         n_events         = n_events,
         wall_time_s      = elapsed_total,
         jax_backend      = jax.default_backend(),
