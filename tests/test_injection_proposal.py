@@ -279,3 +279,73 @@ def test_run_one_debug_reports_cosmic_exception(monkeypatch):
     assert result["ok"] is False
     assert result["reason"] == "cosmic_exception"
     assert "AttributeError" in result["message"]
+
+
+def _hyper_components(n=4):
+    from gwbackpop.inference.hierarchical import POP_PARAM_NAMES
+    vals = {
+        "mu_logalpha1": 0.0, "sig_logalpha1": 0.5,
+        "mu_logalpha2": 0.1, "sig_logalpha2": 0.6,
+        "a_f1": 2.0, "b_f1": 3.0,
+        "a_f2": 2.5, "b_f2": 2.0,
+        "sigma_v1": 60.0, "sigma_v2": 70.0,
+    }
+    row = np.array([vals[k] for k in POP_PARAM_NAMES], dtype=float)
+    return np.tile(row, (n, 1))
+
+
+def test_adaptive_log_q_is_finite_and_contains_broad_component():
+    import gwbackpop.selection.injections as inj
+
+    theta = _theta(80.0, 90.0)
+    theta[PARAMS.index("alpha_1")] = 1.0
+    theta[PARAMS.index("alpha_2")] = 1.1
+    theta[PARAMS.index("flim_1")] = 0.4
+    theta[PARAMS.index("flim_2")] = 0.6
+    broad = inj.compute_log_q_proposal(theta, 1.0, -2.0, inj.KICK_PROPOSAL_SIGMA)
+    mix = inj.compute_adaptive_log_q_proposal(theta, 1.0, -2.0, 0.25, _hyper_components())
+    broad_only = inj.compute_adaptive_log_q_proposal(theta, 1.0, -2.0, 1.0, _hyper_components())
+    assert np.isfinite(mix)
+    assert broad_only == pytest.approx(broad)
+    assert mix >= np.log(0.25) + broad
+
+
+def test_hyperposterior_loader_accepts_pop_param_npz(tmp_path):
+    import gwbackpop.selection.injections as inj
+    from gwbackpop.inference.hierarchical import POP_PARAM_NAMES
+
+    path = tmp_path / "samples.npz"
+    comps = _hyper_components(3)
+    np.savez(path, **{name: comps[:, i] for i, name in enumerate(POP_PARAM_NAMES)})
+    loaded = inj.load_hyperposterior_samples(str(path))
+    assert loaded.shape == comps.shape
+    assert np.all(np.isfinite(loaded))
+
+
+def test_adaptive_generated_npz_is_accepted_by_direct_pdet_loader(tmp_path):
+    from gwbackpop.inference.hierarchical import load_cosmic_merger_catalog_for_selection
+
+    output_path = tmp_path / "adaptive_injections.npz"
+    theta = np.vstack([_theta(80.0, 90.0), _theta(60.0, 70.0)])
+    np.savez(
+        output_path,
+        theta=theta,
+        m1_src=np.array([30.0, 25.0]),
+        m2_src=np.array([20.0, 15.0]),
+        z_merger=np.array([0.2, 0.3]),
+        pdet=np.array([0.5, 0.2]),
+        params=np.array(PARAMS),
+        lower_bound=LOWER,
+        upper_bound=UPPER,
+        N_inj=np.array([10]),
+        N_merge=np.array([2]),
+        kick_proposal_sigma=np.array([50.0]),
+        log_q_proposal=np.array([-10.0, -11.0]),
+        proposal_mode=np.array(["adaptive_hyperposterior"]),
+        broad_mixture_fraction=np.array([0.1]),
+        hyperposterior_path=np.array(["samples.npz"]),
+        mixture_component_count=np.array([4]),
+    )
+    cosmic, metadata, consistent, message = load_cosmic_merger_catalog_for_selection(str(output_path), [], True)
+    assert cosmic["theta"].shape[0] == 2
+    assert np.all(np.isfinite(cosmic["log_q_proposal"]))

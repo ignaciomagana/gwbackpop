@@ -69,7 +69,8 @@ from collections import Counter
 import numpy as np
 from argparse import ArgumentParser, ArgumentTypeError
 from multiprocessing import Pool, cpu_count
-from scipy.stats import maxwell
+from scipy.stats import maxwell, beta as beta_dist, lognorm
+from scipy.special import logsumexp
 from gwbackpop.metadata import base_runtime_metadata, get_package_versions, save_metadata
 
 # ---------------------------------------------------------------------------
@@ -116,21 +117,31 @@ LOGZ_HI = np.log10(0.03)
 ZFORM_MAX = 20.0
 DEBUG_FAILURES = False
 MAX_DEBUG_EXAMPLES = 5
+PROPOSAL_MODE = "broad"
+BROAD_MIXTURE_FRACTION = 1.0
+HYPERPOSTERIOR_COMPONENTS: np.ndarray | None = None
+MIXTURE_COMPONENT_COUNT = 0
+HYPERPOSTERIOR_PATH: str | None = None
 
 
 # ---------------------------------------------------------------------------
 # Worker function (runs in subprocess — must be importable at module level)
 # ---------------------------------------------------------------------------
 
-def _worker_init(pdet_path: str | None, config_name: str = DEFAULT_CONFIG_NAME, likelihood_mode: str = "2D", pdet_callable=None, debug_failures: bool = False) -> None:
+def _worker_init(pdet_path: str | None, config_name: str = DEFAULT_CONFIG_NAME, likelihood_mode: str = "2D", pdet_callable=None, debug_failures: bool = False, proposal_mode: str = "broad", broad_mixture_fraction: float = 1.0, hyperposterior_components=None, hyperposterior_path: str | None = None) -> None:
     """Load P_det interpolator once per worker process.
     If pdet_path is None, P_det evaluation is skipped and pdet=nan is stored.
     Use this mode when building the COSMIC merger catalog for LVKInjectionCampaign.
     """
-    global _PDET, LOWER, UPPER, PARAMS, FIXED_PARAMS, LIKELIHOOD_MODE, DEBUG_FAILURES
+    global _PDET, LOWER, UPPER, PARAMS, FIXED_PARAMS, LIKELIHOOD_MODE, DEBUG_FAILURES, PROPOSAL_MODE, BROAD_MIXTURE_FRACTION, HYPERPOSTERIOR_COMPONENTS, MIXTURE_COMPONENT_COUNT, HYPERPOSTERIOR_PATH
     LOWER, UPPER, PARAMS, FIXED_PARAMS = _load_config(config_name)
     LIKELIHOOD_MODE = str(likelihood_mode).upper()
     DEBUG_FAILURES = bool(debug_failures)
+    PROPOSAL_MODE = str(proposal_mode)
+    BROAD_MIXTURE_FRACTION = float(broad_mixture_fraction)
+    HYPERPOSTERIOR_COMPONENTS = None if hyperposterior_components is None else np.asarray(hyperposterior_components, dtype=np.float64)
+    MIXTURE_COMPONENT_COUNT = 0 if HYPERPOSTERIOR_COMPONENTS is None else int(len(HYPERPOSTERIOR_COMPONENTS))
+    HYPERPOSTERIOR_PATH = hyperposterior_path
     if pdet_callable is not None:
         _PDET = pdet_callable
         return
@@ -147,6 +158,121 @@ def _failure(reason: str, **extra) -> dict | None:
     out = {"ok": False, "reason": reason}
     out.update(extra)
     return out
+
+
+def load_hyperposterior_samples(path: str) -> np.ndarray:
+    """Load posterior samples in POP_PARAM_NAMES order from a no-selection run."""
+    from gwbackpop.inference.hierarchical import POP_PARAM_NAMES
+
+    data = np.load(path, allow_pickle=True)
+    if "samples" in data.files:
+        arr = np.asarray(data["samples"], dtype=np.float64)
+        if arr.ndim == 2 and arr.shape[1] == len(POP_PARAM_NAMES):
+            return arr
+    cols = []
+    missing = []
+    for name in POP_PARAM_NAMES:
+        if name in data.files:
+            cols.append(np.ravel(np.asarray(data[name], dtype=np.float64)))
+        else:
+            missing.append(name)
+    if missing:
+        raise ValueError(f"Hyperposterior file is missing POP_PARAM_NAMES entries: {missing}")
+    n = min(len(c) for c in cols)
+    arr = np.column_stack([c[:n] for c in cols])
+    if arr.size == 0 or not np.all(np.isfinite(arr)):
+        raise ValueError("Hyperposterior samples must be non-empty and finite")
+    return arr
+
+
+def _subsample_hyperposterior(samples: np.ndarray, count: int, seed: int = 271828) -> np.ndarray:
+    samples = np.asarray(samples, dtype=np.float64)
+    if count <= 0 or len(samples) <= count:
+        return samples.copy()
+    rng = np.random.default_rng(seed)
+    return samples[rng.choice(len(samples), size=count, replace=False)]
+
+
+def _draw_truncated_lognormal(rng: np.random.Generator, mu: float, sig: float, lo: float, hi: float) -> float:
+    c0 = lognorm.cdf(lo, s=sig, scale=np.exp(mu))
+    c1 = lognorm.cdf(hi, s=sig, scale=np.exp(mu))
+    return float(lognorm.ppf(rng.uniform(c0, c1), s=sig, scale=np.exp(mu)))
+
+
+def _truncated_lognormal_logpdf(x, mu: float, sig: float, lo: float, hi: float):
+    norm = lognorm.cdf(hi, s=sig, scale=np.exp(mu)) - lognorm.cdf(lo, s=sig, scale=np.exp(mu))
+    lp = lognorm.logpdf(x, s=sig, scale=np.exp(mu)) - np.log(norm)
+    return np.where((lo <= x) & (x <= hi) & (norm > 0), lp, -np.inf)
+
+
+def _component_logpdf_theta(theta: np.ndarray, component: np.ndarray) -> float:
+    from gwbackpop.inference.hierarchical import POP_PARAM_NAMES
+
+    hp = dict(zip(POP_PARAM_NAMES, np.asarray(component, dtype=np.float64)))
+    logp = 0.0
+    for name, mu, sig in (("alpha_1", hp["mu_logalpha1"], hp["sig_logalpha1"]),
+                          ("alpha_2", hp["mu_logalpha2"], hp["sig_logalpha2"])):
+        if name in PARAMS:
+            i = PARAMS.index(name)
+            logp += float(_truncated_lognormal_logpdf(theta[i], mu, sig, LOWER[i], UPPER[i]))
+    for name, a, b in (("flim_1", hp["a_f1"], hp["b_f1"]), ("flim_2", hp["a_f2"], hp["b_f2"])):
+        if name in PARAMS:
+            i = PARAMS.index(name)
+            logp += float(beta_dist.logpdf(theta[i], a, b))
+    for name, sig in (("vk1", hp["sigma_v1"]), ("vk2", hp["sigma_v2"])):
+        if name in PARAMS:
+            i = PARAMS.index(name)
+            logp += float(_truncated_maxwell_logpdf(theta[i], sig, LOWER[i], UPPER[i]))
+    return float(logp)
+
+
+def compute_adaptive_log_q_proposal(theta: np.ndarray, z_form: float, log10_Z: float, eps: float, components: np.ndarray) -> float:
+    """Exact broad/adaptive-mixture proposal density for a stored injection."""
+    broad = compute_log_q_proposal(theta, z_form, log10_Z, KICK_PROPOSAL_SIGMA)
+    if components is None or len(components) == 0:
+        return float(broad)
+    comp = np.array([_component_logpdf_theta(theta, c) for c in components], dtype=np.float64)
+    # Adaptive components retain the same proposal factors for non-varied
+    # dimensions as the broad campaign, replacing only alpha/flim/vk factors.
+    for name in ("alpha_1", "alpha_2", "flim_1", "flim_2", "vk1", "vk2"):
+        if name in PARAMS:
+            i = PARAMS.index(name)
+            if name in ("vk1", "vk2"):
+                broad -= float(_truncated_maxwell_logpdf(theta[i], KICK_PROPOSAL_SIGMA, LOWER[i], UPPER[i]))
+            elif name in ("phi1", "phi2"):
+                pass
+            else:
+                broad -= float(-np.log(UPPER[i] - LOWER[i]))
+    adaptive = broad + logsumexp(comp) - np.log(len(comp))
+    terms = []
+    if eps > 0:
+        terms.append(np.log(eps) + compute_log_q_proposal(theta, z_form, log10_Z, KICK_PROPOSAL_SIGMA))
+    if eps < 1:
+        terms.append(np.log1p(-eps) + adaptive)
+    return float(logsumexp(terms))
+
+
+def _draw_theta_adaptive(rng: np.random.Generator) -> np.ndarray:
+    theta = rng.uniform(LOWER, UPPER)
+    if HYPERPOSTERIOR_COMPONENTS is None or rng.uniform() < BROAD_MIXTURE_FRACTION:
+        for kick_name in ("vk1", "vk2"):
+            if kick_name in PARAMS:
+                i = PARAMS.index(kick_name)
+                theta[i] = _draw_truncated_maxwell(rng, KICK_PROPOSAL_SIGMA, LOWER[i], UPPER[i])
+        return theta
+    from gwbackpop.inference.hierarchical import POP_PARAM_NAMES
+    hp = dict(zip(POP_PARAM_NAMES, HYPERPOSTERIOR_COMPONENTS[rng.integers(len(HYPERPOSTERIOR_COMPONENTS))]))
+    for name, mu, sig in (("alpha_1", hp["mu_logalpha1"], hp["sig_logalpha1"]),
+                          ("alpha_2", hp["mu_logalpha2"], hp["sig_logalpha2"])):
+        if name in PARAMS:
+            i = PARAMS.index(name); theta[i] = _draw_truncated_lognormal(rng, mu, sig, LOWER[i], UPPER[i])
+    for name, a, b in (("flim_1", hp["a_f1"], hp["b_f1"]), ("flim_2", hp["a_f2"], hp["b_f2"])):
+        if name in PARAMS:
+            theta[PARAMS.index(name)] = float(rng.beta(a, b))
+    for name, sig in (("vk1", hp["sigma_v1"]), ("vk2", hp["sigma_v2"])):
+        if name in PARAMS:
+            i = PARAMS.index(name); theta[i] = _draw_truncated_maxwell(rng, sig, LOWER[i], UPPER[i])
+    return theta
 
 
 def _run_one(seed: int) -> dict | None:
@@ -168,12 +294,14 @@ def _run_one(seed: int) -> dict | None:
     # Rationale: uniform [0,500] km/s gives f_merge ≈ 0 because most kicks
     # disrupt the binary.  Maxwellian concentrates where mergers occur
     # while maintaining support over the full [0,500] range.
-    theta = rng.uniform(LOWER, UPPER)
+    theta = _draw_theta_adaptive(rng) if PROPOSAL_MODE == "adaptive_hyperposterior" else rng.uniform(LOWER, UPPER)
     params_dict = dict(zip(PARAMS, theta))
 
     # Overwrite vk1 and vk2 with exactly truncated Maxwellian draws.
     # Do not clip: clipping would create an atom at the upper bound.
     for kick_name in ('vk1', 'vk2'):
+        if PROPOSAL_MODE == "adaptive_hyperposterior":
+            continue
         if kick_name in PARAMS:
             i_kick = PARAMS.index(kick_name)
             params_dict[kick_name] = _draw_truncated_maxwell(
@@ -209,7 +337,12 @@ def _run_one(seed: int) -> dict | None:
     if 'z_form' in PARAMS:
         theta[PARAMS.index('z_form')] = z_form
 
-    log_q_proposal = compute_log_q_proposal(theta, z_form, log10_Z, KICK_PROPOSAL_SIGMA)
+    if PROPOSAL_MODE == "adaptive_hyperposterior":
+        log_q_proposal = compute_adaptive_log_q_proposal(
+            theta, z_form, log10_Z, BROAD_MIXTURE_FRACTION, HYPERPOSTERIOR_COMPONENTS
+        )
+    else:
+        log_q_proposal = compute_log_q_proposal(theta, z_form, log10_Z, KICK_PROPOSAL_SIGMA)
     if not np.isfinite(log_q_proposal):
         return _failure("invalid_log_q_proposal")
 
@@ -524,6 +657,10 @@ def run_campaign(
     snr_orientation_seed: int = 1234,
     snr_n_orientation: int = 200000,
     debug_failures: bool = False,
+    proposal_mode: str = "broad",
+    hyperposterior_path: str | None = None,
+    broad_mixture_fraction: float = 0.1,
+    mixture_component_count: int = 512,
 ) -> None:
     """Run the full injection campaign and save results.
 
@@ -541,12 +678,28 @@ def run_campaign(
         Seeds per Pool.map call — balances overhead vs memory.
     """
     config_name = config_name or DEFAULT_CONFIG_NAME
-    global LOWER, UPPER, PARAMS, FIXED_PARAMS, LIKELIHOOD_MODE, DEBUG_FAILURES
+    global LOWER, UPPER, PARAMS, FIXED_PARAMS, LIKELIHOOD_MODE, DEBUG_FAILURES, PROPOSAL_MODE, BROAD_MIXTURE_FRACTION, HYPERPOSTERIOR_COMPONENTS, MIXTURE_COMPONENT_COUNT, HYPERPOSTERIOR_PATH
     LOWER, UPPER, PARAMS, FIXED_PARAMS = _load_config(config_name)
     LIKELIHOOD_MODE = str(likelihood_mode).upper()
     DEBUG_FAILURES = bool(debug_failures)
     if LIKELIHOOD_MODE not in {"2D", "3D"}:
         raise ValueError("likelihood_mode must be 2D or 3D")
+    PROPOSAL_MODE = str(proposal_mode)
+    if PROPOSAL_MODE not in {"broad", "adaptive_hyperposterior"}:
+        raise ValueError("proposal_mode must be broad or adaptive_hyperposterior")
+    BROAD_MIXTURE_FRACTION = float(broad_mixture_fraction)
+    if not (0.0 <= BROAD_MIXTURE_FRACTION <= 1.0):
+        raise ValueError("broad_mixture_fraction must be in [0, 1]")
+    HYPERPOSTERIOR_PATH = hyperposterior_path
+    HYPERPOSTERIOR_COMPONENTS = None
+    MIXTURE_COMPONENT_COUNT = 0
+    if PROPOSAL_MODE == "adaptive_hyperposterior":
+        if not hyperposterior_path:
+            raise ValueError("adaptive_hyperposterior requires hyperposterior_path")
+        HYPERPOSTERIOR_COMPONENTS = _subsample_hyperposterior(
+            load_hyperposterior_samples(hyperposterior_path), int(mixture_component_count)
+        )
+        MIXTURE_COMPONENT_COUNT = int(len(HYPERPOSTERIOR_COMPONENTS))
 
     os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
     pdet_path_resolved, pdet_callable, pdet_metadata = resolve_pdet_callable(
@@ -573,6 +726,7 @@ def run_campaign(
         "do not combine its log_q_proposal with older proposal versions."
     )
     print(f"[injections] pdet_mode: {pdet_metadata['pdet_mode']}")
+    print(f"[injections] proposal_mode: {PROPOSAL_MODE}")
     print(f"[injections] pdet: {pdet_path_resolved}")
     print(f"[injections] output: {output_path}")
     print()
@@ -580,7 +734,8 @@ def run_campaign(
     with Pool(
         processes=n_workers,
         initializer=_worker_init,
-        initargs=(pdet_path_resolved, config_name, LIKELIHOOD_MODE, pdet_callable, debug_failures),
+        initargs=(pdet_path_resolved, config_name, LIKELIHOOD_MODE, pdet_callable, debug_failures,
+                  PROPOSAL_MODE, BROAD_MIXTURE_FRACTION, HYPERPOSTERIOR_COMPONENTS, HYPERPOSTERIOR_PATH),
     ) as pool:
         for i in range(0, n_inj, chunk_size):
             batch = seeds[i : i + chunk_size]
@@ -656,8 +811,25 @@ def run_campaign(
     if using_pdet:
         print(f"  <P_det>        = {pdet.mean():.4f}")
         print(f"  N_eff_detected = {(pdet.sum()**2 / (pdet**2).sum()):.0f}")
+        if HYPERPOSTERIOR_COMPONENTS is not None:
+            from gwbackpop.inference.hierarchical import compute_direct_pdet_selection_weight_diagnostics
+            cosmic_diag = dict(
+                theta=theta, params=PARAMS, lo=LOWER, hi=UPPER, kick_sigma=KICK_PROPOSAL_SIGMA,
+                log_q_proposal=log_q_proposal, log_pop_static=np.zeros(len(theta)),
+                pdet=pdet, N_inj=n_inj, N_merge=n_merge,
+            )
+            selection_diag = compute_direct_pdet_selection_weight_diagnostics(
+                np.median(HYPERPOSTERIOR_COMPONENTS, axis=0), "no_selection_posterior_median", cosmic_diag
+            )
+            print(f"  pdet-positive  = {selection_diag['positive_pdet_count']:,}")
+            print(f"  sel ESS@median = {selection_diag['injection_ess']:.1f}")
+            print(f"  top1 alpha frac= {selection_diag['top_1pct_alpha_fraction']:.4f}")
+            print(f"  top0.1 alpha   = {selection_diag['top_0p1pct_alpha_fraction']:.4f}")
+        else:
+            selection_diag = {}
     else:
         print("  P_det: not evaluated (LVK raw-injection mode — pdet=nan stored)")
+        selection_diag = {}
     print(f"  m1_src range   = [{m1_src.min():.1f}, {m1_src.max():.1f}] M_sun")
     print(f"  z_merger range = [{z_merger.min():.3f}, {z_merger.max():.3f}]")
 
@@ -674,6 +846,17 @@ def run_campaign(
         config_name=config_name,
         proposal_version=PROPOSAL_VERSION,
         proposal_name=PROPOSAL_NAME,
+        proposal_mode=PROPOSAL_MODE,
+        broad_mixture_fraction=float(BROAD_MIXTURE_FRACTION),
+        hyperposterior_path=HYPERPOSTERIOR_PATH,
+        mixture_component_count=int(MIXTURE_COMPONENT_COUNT),
+        proposal_metadata=(
+            "adaptive_hyperposterior draws alpha/flim/vk from a no-selection "
+            "hyperposterior mixture and evaluates exact broad/adaptive log_q via logsumexp; "
+            "all other proposal factors follow the selected 2D/3D injection mode."
+            if PROPOSAL_MODE == "adaptive_hyperposterior" else proposal_distribution_description
+        ),
+        adaptive_selection_diagnostics=selection_diag,
         proposal_distribution_description=proposal_distribution_description,
         log_q_proposal_available=bool(np.all(np.isfinite(log_q_proposal))),
         fixed_parameters=FIXED_PARAMS,
@@ -717,6 +900,10 @@ def run_campaign(
         N_workers            = np.array([n_workers]),
         kick_proposal_sigma  = np.array([KICK_PROPOSAL_SIGMA]),
         proposal_name         = np.array([PROPOSAL_NAME]),
+        proposal_mode         = np.array([PROPOSAL_MODE]),
+        broad_mixture_fraction = np.array([BROAD_MIXTURE_FRACTION]),
+        hyperposterior_path   = np.array([HYPERPOSTERIOR_PATH or ""]),
+        mixture_component_count = np.array([MIXTURE_COMPONENT_COUNT]),
         proposal_version      = np.array([PROPOSAL_VERSION]),
         coordinate_system     = np.array([COORDINATE_SYSTEM]),
         config_name           = np.array([config_name]),
@@ -796,6 +983,14 @@ def parse_args():
                    help="BackPop config name whose params/bounds are used for injections (default: lucky_strikes).")
     p.add_argument("--likelihood_mode", choices=["2D", "3D"], default="2D",
                    help="Selection base measure metadata/proposal: 2D uses flat logZ and no population z_form; 3D uses SFR z_form and P(logZ|z_form).")
+    p.add_argument("--proposal_mode", choices=["broad", "adaptive_hyperposterior"], default="broad",
+                   help="Injection proposal: original broad proposal or mixture adapted to a no-selection hyperposterior.")
+    p.add_argument("--hyperposterior_path", default=None,
+                   help="No-selection samples.npz containing POP_PARAM_NAMES samples for adaptive_hyperposterior.")
+    p.add_argument("--broad_mixture_fraction", type=float, default=0.1,
+                   help="Mixture weight for the original broad proposal in adaptive_hyperposterior mode.")
+    p.add_argument("--mixture_component_count", type=int, default=512,
+                   help="Number of hyperposterior components to use when evaluating the adaptive mixture density.")
     return p.parse_args()
 
 
@@ -828,6 +1023,10 @@ def main():
         snr_orientation_seed = opts.snr_orientation_seed,
         snr_n_orientation = opts.snr_n_orientation,
         debug_failures = debug_failures,
+        proposal_mode = opts.proposal_mode,
+        hyperposterior_path = opts.hyperposterior_path,
+        broad_mixture_fraction = opts.broad_mixture_fraction,
+        mixture_component_count = opts.mixture_component_count,
     )
 
 
