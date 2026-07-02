@@ -26,8 +26,8 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest"]
-cosmic = ["cosmic-popsynth"]
-all = ["pytest", "cosmic-popsynth"]
+cosmic = ["cosmic-popsynth>=4.1.0,<4.2.0"]
+all = ["pytest", "cosmic-popsynth>=4.1.0,<4.2.0"]
 
 [project.scripts]
 gwbackpop-run-event = "gwbackpop.cli.run_backpop:main"
@@ -37,6 +37,7 @@ gwbackpop-calibrate-snr-pdet = "gwbackpop.selection.calibrate_snr_pdet:main"
 gwbackpop-plot-event = "gwbackpop.cli.plot_backpop:main"
 gwbackpop-plot-hierarchical = "gwbackpop.cli.plot_hierarchical:main"
 gwbackpop-smoke-test = "gwbackpop.cli.smoke_test:main"
+gwbackpop-cosmic-doctor = "gwbackpop.evolution.cosmic_capabilities:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

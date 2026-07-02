@@ -72,6 +72,10 @@ from multiprocessing import Pool, cpu_count
 from scipy.stats import maxwell, beta as beta_dist, lognorm
 from scipy.special import logsumexp
 from gwbackpop.metadata import base_runtime_metadata, get_package_versions, save_metadata
+from gwbackpop.evolution.cosmic_capabilities import (
+    inspect_cosmic_capabilities,
+    require_supported_cosmic_for_independent_alpha_flim,
+)
 from gwbackpop.population.constants import POP_PARAM_NAMES
 
 # ---------------------------------------------------------------------------
@@ -136,6 +140,10 @@ def _worker_init(pdet_path: str | None, config_name: str = DEFAULT_CONFIG_NAME, 
     """
     global _PDET, LOWER, UPPER, PARAMS, FIXED_PARAMS, LIKELIHOOD_MODE, DEBUG_FAILURES, PROPOSAL_MODE, BROAD_MIXTURE_FRACTION, HYPERPOSTERIOR_COMPONENTS, MIXTURE_COMPONENT_COUNT, HYPERPOSTERIOR_PATH
     LOWER, UPPER, PARAMS, FIXED_PARAMS = _load_config(config_name)
+    require_supported_cosmic_for_independent_alpha_flim(
+        config_name=config_name,
+        params=PARAMS,
+    )
     LIKELIHOOD_MODE = str(likelihood_mode).upper()
     DEBUG_FAILURES = bool(debug_failures)
     PROPOSAL_MODE = str(proposal_mode)
@@ -676,6 +684,10 @@ def run_campaign(
     config_name = config_name or DEFAULT_CONFIG_NAME
     global LOWER, UPPER, PARAMS, FIXED_PARAMS, LIKELIHOOD_MODE, DEBUG_FAILURES, PROPOSAL_MODE, BROAD_MIXTURE_FRACTION, HYPERPOSTERIOR_COMPONENTS, MIXTURE_COMPONENT_COUNT, HYPERPOSTERIOR_PATH
     LOWER, UPPER, PARAMS, FIXED_PARAMS = _load_config(config_name)
+    require_supported_cosmic_for_independent_alpha_flim(
+        config_name=config_name,
+        params=PARAMS,
+    )
     LIKELIHOOD_MODE = str(likelihood_mode).upper()
     DEBUG_FAILURES = bool(debug_failures)
     if LIKELIHOOD_MODE not in {"2D", "3D"}:
@@ -839,9 +851,16 @@ def run_campaign(
         "uniform omega; z_form from SFR-weighted comoving-volume prior on "
         f"[0,{ZFORM_MAX}]; logZ uniform for 2D mode and P(logZ|z_form) for 3D mode."
     )
+    cosmic_capabilities = inspect_cosmic_capabilities()
     metadata = dict(
         **base_runtime_metadata("."),
         package_versions=get_package_versions(["numpy", "scipy", "astropy", "cosmic"]),
+        cosmic_capabilities=cosmic_capabilities,
+        cosmic_popsynth_version=cosmic_capabilities["cosmic_popsynth_version"],
+        supports_independent_alpha=cosmic_capabilities["supports_independent_alpha"],
+        supports_independent_flim=cosmic_capabilities["supports_independent_flim"],
+        supports_cosmic410_evolv2_signature=cosmic_capabilities["supports_cosmic410_evolv2_signature"],
+        supported_for_independent_alpha_flim=cosmic_capabilities["supported_for_independent_alpha_flim"],
         config_name=config_name,
         proposal_version=PROPOSAL_VERSION,
         proposal_name=PROPOSAL_NAME,
@@ -927,6 +946,11 @@ def run_campaign(
         snr_n_orientation    = np.array([pdet_metadata.get("snr_n_orientation", -1)]),
         pdet_is_diagnostic   = np.array([pdet_metadata.get("pdet_is_diagnostic", False)]),
         pdet_production_ready = np.array([pdet_metadata.get("pdet_production_ready", pdet_metadata["pdet_mode"] == "pickle")]),
+        cosmic_popsynth_version = np.array([cosmic_capabilities["cosmic_popsynth_version"] or ""]),
+        supports_independent_alpha = np.array([cosmic_capabilities["supports_independent_alpha"]]),
+        supports_independent_flim = np.array([cosmic_capabilities["supports_independent_flim"]]),
+        supports_cosmic410_evolv2_signature = np.array([cosmic_capabilities["supports_cosmic410_evolv2_signature"]]),
+        supported_for_independent_alpha_flim = np.array([cosmic_capabilities["supported_for_independent_alpha_flim"]]),
         metadata             = np.array(metadata, dtype=object),
     )
     catalog_path = os.fspath(output_path)
