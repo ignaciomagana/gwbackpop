@@ -1,135 +1,94 @@
 #!/bin/bash
 # =============================================================================
-# run_catalog_gwtc3.slurm
+# run_catalog_gwtc3_cosmic410_9ev.slurm
 #
-# SLURM array job to run BackPop single-event inference over the clean GWTC-3
-# BBH catalog.  One SLURM task per event, all tasks run in parallel.
+# Regenerate the 9 O1/O2 single-event BackPop runs with cosmic-popsynth==4.1.0.
 #
-# Event selection criteria (following Wong+2023):
-#   - Confident BBH detections from GWTC-2.1 / GWTC-3
-#   - Primary mass below the PISN gap (m1 < ~45 M_sun detector frame) so
-#     COSMIC can produce consistent progenitors
-#   - No confident BNS events (GW170817, GW190425)
-#   - GW190814 included separately (the Lucky Strikes reference event)
-#   - Events flagged as marginal or uncertain classification excluded
+# IMPORTANT:
+#   gwbackpop-run-event writes to:
+#       results/<EVENT>/<CONFIG>
+#   relative to the current working directory.
 #
-# Config: lucky_strikes (full 17D — both kicks free)
-# Both 2D and 3D likelihood modes are run per event.
+# This script uses a small work directory with a symlink:
+#       ${WORKDIR}/results -> ${RUN_ROOT}/${RESULTS_SUBDIR}
+#
+# Default output:
+#       /hildafs/projects/phy230054p/share/backpop_results/results_cosmic410/<EVENT>/lucky_strikes
+#
+# To overwrite/use the old results directory instead:
+#       sbatch --export=ALL,RESULTS_SUBDIR=results workflows/slurm/run_catalog_gwtc3_cosmic410_9ev.slurm
 #
 # Submit:
-#   sbatch workflows/slurm/run_catalog_gwtc3.slurm
+#       mkdir -p /hildafs/projects/phy230054p/share/backpop_results/logs
+#       sbatch workflows/slurm/run_catalog_gwtc3_cosmic410_9ev.slurm
 #
-# Override PE samples directory:
-#   sbatch --export=ALL,PE_DIR=/path/to/samples workflows/slurm/run_catalog_gwtc3.slurm
-#
-# Run a specific subset (e.g. tasks 0–4):
-#   sbatch --array=0-4 workflows/slurm/run_catalog_gwtc3.slurm
+# Run subset:
+#       sbatch --array=0-2 workflows/slurm/run_catalog_gwtc3_cosmic410_9ev.slurm
 # =============================================================================
 
-#SBATCH --job-name=backpop_gwtc3
-#SBATCH --output=logs/backpop_%A_%a.out
-#SBATCH --error=logs/backpop_%A_%a.err
-#SBATCH --array=0-8          # 47 events total (0-indexed); adjust if list changes
+#SBATCH --job-name=backpop_c410
+#SBATCH --output=/hildafs/projects/phy230054p/share/backpop_results/logs/backpop_c410_%A_%a.out
+#SBATCH --error=/hildafs/projects/phy230054p/share/backpop_results/logs/backpop_c410_%A_%a.err
+#SBATCH --array=0-8
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=24    # Nautilus worker threads — matches lucky_strikes runtime
+#SBATCH --cpus-per-task=24
 #SBATCH --mem=32G
-#SBATCH --time=48:00:00       # 4hr wall time; GW190814-like hard events may need 6hr
-#SBATCH --partition=RM # adjust to your cluster partition
-#SBATCH --account=phy230054p                                          
+#SBATCH --time=48:00:00
+#SBATCH --partition=RM
+#SBATCH --account=phy230054p
+
+set -euo pipefail
 
 # ---------------------------------------------------------------------------
-# Cluster-specific setup — edit for your system
+# Paths / environment
 # ---------------------------------------------------------------------------
 
-# Conda environment with COSMIC (array alpha1), Nautilus, pesummary
-CONDA_ENV="backpop"
+CONDA_ENV="${CONDA_ENV:-gwbackpop-cosmic410}"
 
-# Root directory of the BackPop codebase
-BACKPOP_DIR="/hildafs/projects/phy230014p/magana/backpop_claude"
+CODE_DIR="${CODE_DIR:-/hildafs/projects/phy230014p/magana/src/gwbackpop}"
+RUN_ROOT="${RUN_ROOT:-/hildafs/projects/phy230054p/share/backpop_results}"
 
-# Root directory containing all PE samples HDF5 files
-# Expected layout: ${PE_DIR}/IGWN-GWTC*-v*-<EVENT>_*_PEDataRelease_mixed_nocosmo.h5
+# Default keeps COSMIC-4.1 products separate from the old scalar-COSMIC products.
+# Set RESULTS_SUBDIR=results only if you intentionally want to overwrite/reuse old paths.
+RESULTS_SUBDIR="${RESULTS_SUBDIR:-results_cosmic410}"
+RESULTS_ROOT="${RUN_ROOT}/${RESULTS_SUBDIR}"
+
+# Workdir only exists so gwbackpop-run-event can write to ./results/...
+WORKDIR="${RUN_ROOT}/work_${RESULTS_SUBDIR}"
+
+LOG_DIR="${RUN_ROOT}/logs"
+
 PE_DIR="${PE_DIR:-/hildafs/projects/phy220048p/share/GWTC-PESamples/gwtc3_bbh_1peryr}"
 
-# Results root
-RESULTS_ROOT="${BACKPOP_DIR}/results"
-
-cd "${BACKPOP_DIR}"
-mkdir -p logs
-
-# Nautilus settings — conservative; reduce for faster turnaround
-NLIVE=2000
-NEFF=10000
-FMT="pdf"
+mkdir -p "${LOG_DIR}" "${RESULTS_ROOT}" "${WORKDIR}"
+ln -sfn "${RESULTS_ROOT}" "${WORKDIR}/results"
 
 # ---------------------------------------------------------------------------
-# Clean GWTC-3 BBH event list
-# Ordered roughly by network SNR (high to low) within O1/O2/O3a/O3b.
-# Events excluded from default run listed at the bottom with reasons.
+# Nautilus / plotting settings
+# ---------------------------------------------------------------------------
+
+NLIVE="${NLIVE:-2000}"
+NEFF="${NEFF:-10000}"
+FMT="${FMT:-pdf}"
+APPROXIMANT="${APPROXIMANT:-C01:Mixed}"
+SUPPORT_GATE="${SUPPORT_GATE:-none}"
+SUPPORT_HDI="${SUPPORT_HDI:-0.999}"
+
+# ---------------------------------------------------------------------------
+# Event list: exactly the 9 events currently present in your old results/
 # ---------------------------------------------------------------------------
 
 EVENTS=(
-    # ---- O1 ----
-    "GW150914"          # reference; ~30+35 M_sun, high SNR
-    "GW151226"          # ~14+8 M_sun
-    # ---- O2 ----
-    "GW170104"          # ~31+20 M_sun
-    "GW170608"          # ~12+7 M_sun; lowest mass clean O2 BBH
-    "GW170729"          # ~51+34 M_sun; near-PISN but included — check posterior
-    "GW170809"          # ~35+24 M_sun
-    "GW170814"          # triple-detector; ~31+25 M_sun
-    "GW170818"          # ~36+27 M_sun
-    "GW170823"          # ~40+29 M_sun
-    # ---- O3a ----
-    "GW190408_181802"
-    "GW190412"          # asymmetric mass ratio; m1~30, m2~8
-    "GW190413_052954"
-    "GW190413_134308"
-    "GW190421_213856"
-    "GW190503_185404"
-    "GW190512_180714"
-    "GW190513_205428"
-    "GW190514_065416"
-    "GW190517_055101"
-    "GW190519_153544"
-    "GW190521_074359"   # near PISN boundary — expect poor COSMIC coverage
-    "GW190527_092055"
-    "GW190602_175927"
-    "GW190620_030421"
-    "GW190630_185205"
-    "GW190701_203306"
-    "GW190706_222641"
-    "GW190707_093326"
-    "GW190708_232457"
-    "GW190719_215514"
-    "GW190720_000836"
-    "GW190727_060333"
-    "GW190728_064510"
-    "GW190731_140936"
-    "GW190803_022701"
-    "GW190814"          # Lucky Strikes reference; NSBH / mass-gap secondary
-    "GW190828_063405"
-    "GW190828_065509"
-    "GW190910_112807"
-    "GW190915_235702"
-    "GW190924_021846"
-    "GW190929_012149"
-    # ---- O3b ----
-    "GW191105_143521"
-    "GW191109_010717"
-    "GW191129_134029"
-    "GW191204_171526"
-    "GW191215_223052"
-    "GW191222_033537"
-    "GW200202_154313"
-    "GW200225_060421"
-    "GW200311_115853"
+    "GW150914"
+    "GW151226"
+    "GW170104"
+    "GW170608"
+    "GW170729"
+    "GW170809"
+    "GW170814"
+    "GW170818"
+    "GW170823"
 )
-# Excluded events (add back with care):
-#   GW190521         — primary > 85 M_sun, above PISN gap for COSMIC
-#   GW190425         — BNS, COSMIC kick stochasticity too high for Nautilus
-#   GW170817         — BNS, same reason
-#   GW190814_211741  — duplicate entry; GW190814 above is the correct ID
 
 N_EVENTS=${#EVENTS[@]}
 if [ "${SLURM_ARRAY_TASK_ID}" -ge "${N_EVENTS}" ]; then
@@ -146,71 +105,108 @@ EVENT="${EVENTS[${SLURM_ARRAY_TASK_ID}]}"
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate "${CONDA_ENV}"
 
+cd "${CODE_DIR}"
+git rev-parse --short HEAD || true
+
+# Ensure editable install points at this checkout.
+python -m pip install -e . >/dev/null
+hash -r
+
 for cmd in gwbackpop-run-event gwbackpop-plot-event; do
     if ! command -v "${cmd}" >/dev/null 2>&1; then
         echo "ERROR: ${cmd} not found after activating ${CONDA_ENV}."
-        echo "Install with: python -m pip install -e '.[cosmic]' or activate the correct environment."
+        echo "Install/check env with: python -m pip install -e '.[cosmic]'"
         exit 1
     fi
 done
 
+# Preflight: confirm COSMIC 4.1 ABI is live.
+python - <<'PY'
+import importlib.metadata as im
+import numpy as np
+from cosmic import _evolvebin
+
+print("[preflight] cosmic-popsynth:", im.version("cosmic-popsynth"))
+print("[preflight] evolv2:", (_evolvebin.evolv2.__doc__ or "").splitlines()[0])
+print("[preflight] cevars.alpha1 shape:", np.asarray(_evolvebin.cevars.alpha1).shape)
+print("[preflight] mtvars.acc_lim shape:", np.asarray(_evolvebin.mtvars.acc_lim).shape)
+print("[preflight] has se_flags:", hasattr(_evolvebin, "se_flags"))
+
+assert np.asarray(_evolvebin.cevars.alpha1).shape == (2,)
+assert np.asarray(_evolvebin.mtvars.acc_lim).shape == (2,)
+assert hasattr(_evolvebin, "se_flags")
+PY
+
+# Now cd to run root workdir so gwbackpop-run-event writes into ./results,
+# which is symlinked to ${RESULTS_ROOT}.
+cd "${WORKDIR}"
+
 echo "============================================================"
-echo " Task:    ${SLURM_ARRAY_TASK_ID} / $((N_EVENTS-1))"
-echo " Event:   ${EVENT}"
-echo " Node:    $(hostname)"
-echo " CPUs:    ${SLURM_CPUS_PER_TASK}"
-echo " Started: $(date)"
+echo " Task:          ${SLURM_ARRAY_TASK_ID} / $((N_EVENTS-1))"
+echo " Event:         ${EVENT}"
+echo " Node:          $(hostname)"
+echo " CPUs:          ${SLURM_CPUS_PER_TASK}"
+echo " Env:           ${CONDA_ENV}"
+echo " Code dir:      ${CODE_DIR}"
+echo " Run root:      ${RUN_ROOT}"
+echo " Results root:  ${RESULTS_ROOT}"
+echo " Workdir:       ${WORKDIR}"
+echo " PE dir:        ${PE_DIR}"
+echo " Started:       $(date)"
 echo "============================================================"
 
 # ---------------------------------------------------------------------------
-# Locate PE samples file
-# Tries common GWTC naming patterns; fails clearly if not found.
+# Locate PE samples
 # ---------------------------------------------------------------------------
 
 find_samples() {
     local event="$1"
-    local base_event
-    # Strip sub-second suffix for search (some files use truncated names)
-    base_event="${event%%_*}"
-    # Try exact match first, then glob
-    local f
-    f=$(find "${PE_DIR}" -maxdepth 1 \
-        -name "*${event}*PEDataRelease*mixed*nocosmo*.h5" \
-        -o -name "*${event}*PEDataRelease*mixed*.h5" 2>/dev/null | head -1)
-    if [ -z "$f" ]; then
-        f=$(find "${PE_DIR}" -maxdepth 1 \
-            -name "*${base_event}*PEDataRelease*mixed*.h5" 2>/dev/null | head -1)
+    local base_event="${event%%_*}"
+    local f=""
+
+    f=$(find "${PE_DIR}" -maxdepth 1 \( \
+        -name "*${event}*PEDataRelease*mixed*nocosmo*.h5" -o \
+        -name "*${event}*PEDataRelease*mixed*.h5" -o \
+        -name "*${event}*.h5" \
+        \) 2>/dev/null | head -1)
+
+    if [ -z "${f}" ]; then
+        f=$(find "${PE_DIR}" -maxdepth 1 \( \
+            -name "*${base_event}*PEDataRelease*mixed*nocosmo*.h5" -o \
+            -name "*${base_event}*PEDataRelease*mixed*.h5" -o \
+            -name "*${base_event}*.h5" \
+            \) 2>/dev/null | head -1)
     fi
-    echo "$f"
+
+    echo "${f}"
 }
 
-SAMPLES=$(find_samples "${EVENT}")
+SAMPLES="$(find_samples "${EVENT}")"
 
 if [ -z "${SAMPLES}" ]; then
     echo "ERROR: PE samples file not found for ${EVENT} in ${PE_DIR}"
-    echo "  Searched for: *${EVENT}*PEDataRelease*mixed*.h5"
-    echo "  Available files:"
-    ls "${PE_DIR}"/*.h5 2>/dev/null | head -20
+    echo "Available HDF5 files:"
+    find "${PE_DIR}" -maxdepth 1 -name "*.h5" 2>/dev/null | head -40
     exit 1
 fi
 
 echo "Samples: ${SAMPLES}"
 
-# ---------------------------------------------------------------------------
-# Helper: elapsed time since epoch second
-# ---------------------------------------------------------------------------
 elapsed() {
-    local dt=$(( $(date +%s) - $1 ))
+    local start="$1"
+    local dt=$(( $(date +%s) - start ))
     printf "%dh %02dm %02ds" $(( dt/3600 )) $(( (dt%3600)/60 )) $(( dt%60 ))
 }
 
+T0=$(date +%s)
+
 # ---------------------------------------------------------------------------
-# [1/3] 2D inference — lucky_strikes (16D, flat logZ prior)
+# 2D inference — lucky_strikes
 # ---------------------------------------------------------------------------
 
 echo ""
 echo "─────────────────────────────────────────────────────────────"
-echo " [1/3]  2D inference — lucky_strikes"
+echo " [1/3] 2D inference — lucky_strikes, COSMIC 4.1"
 echo "─────────────────────────────────────────────────────────────"
 T1=$(date +%s)
 
@@ -219,56 +215,75 @@ gwbackpop-run-event \
     --event_name               "${EVENT}" \
     --config_name              lucky_strikes \
     --use_redshift_likelihood  False \
-    --approximant              "C01:Mixed" \
+    --approximant              "${APPROXIMANT}" \
     --use_pe_weights           True \
+    --mass_frame               auto \
     --nlive                    "${NLIVE}" \
     --neff                     "${NEFF}" \
-    --resume                   False
+    --support_gate             "${SUPPORT_GATE}" \
+    --support_hdi              "${SUPPORT_HDI}" \
+    --resume                   False \
+    --max_threads              "${SLURM_CPUS_PER_TASK}"
 
-echo ">>> 2D done ($(elapsed ${T1}))"
+echo ">>> 2D done ($(elapsed "${T1}"))"
 
-# ---------------------------------------------------------------------------
-# [2/3] 3D inference — lucky_strikes_zform (17D, cosmological prior)
-# ---------------------------------------------------------------------------
-
-#echo ""
-#echo "─────────────────────────────────────────────────────────────"
-#echo " [2/3]  3D inference — lucky_strikes_zform"
-#echo "─────────────────────────────────────────────────────────────"
-#T2=$(date +%s)
-#
-#gwbackpop-run-event \
-#    --samples_path             "${SAMPLES}" \
-#    --event_name               "${EVENT}" \
-#    --config_name              lucky_strikes_zform \
-#    --use_redshift_likelihood  True \
-#    --approximant              "C01:Mixed" \
-#    --use_pe_weights           True \
-#    --nlive                    "${NLIVE}" \
-#    --neff                     "${NEFF}" \
-#    --resume                   False
-#
-#echo ">>> 3D done ($(elapsed ${T2}))"
+RESULT_DIR_2D="${RESULTS_ROOT}/${EVENT}/lucky_strikes"
 
 # ---------------------------------------------------------------------------
-# [3/3] Plots
+# 3D inference — lucky_strikes_zform
 # ---------------------------------------------------------------------------
 
 echo ""
 echo "─────────────────────────────────────────────────────────────"
-echo " [3/3]  Plotting"
+echo " [2/3] 3D inference — lucky_strikes_zform, COSMIC 4.1"
+echo "─────────────────────────────────────────────────────────────"
+T2=$(date +%s)
+
+gwbackpop-run-event \
+    --samples_path             "${SAMPLES}" \
+    --event_name               "${EVENT}" \
+    --config_name              lucky_strikes_zform \
+    --use_redshift_likelihood  True \
+    --approximant              "${APPROXIMANT}" \
+    --use_pe_weights           True \
+    --mass_frame               auto \
+    --nlive                    "${NLIVE}" \
+    --neff                     "${NEFF}" \
+    --support_gate             "${SUPPORT_GATE}" \
+    --support_hdi              "${SUPPORT_HDI}" \
+    --resume                   False \
+    --max_threads              "${SLURM_CPUS_PER_TASK}"
+
+echo ">>> 3D done ($(elapsed "${T2}"))"
+
+RESULT_DIR_3D="${RESULTS_ROOT}/${EVENT}/lucky_strikes_zform"
+
+# ---------------------------------------------------------------------------
+# Plot: 2D, 3D comparison
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "─────────────────────────────────────────────────────────────"
+echo " [3/3] Plotting — lucky_strikes 2D vs 3D"
 echo "─────────────────────────────────────────────────────────────"
 T3=$(date +%s)
 
 gwbackpop-plot-event \
-    --results_dir  "${RESULTS_ROOT}/${EVENT}/lucky_strikes" \
+    --results_dir  "${RESULT_DIR_2D}" \
+    --compare_dir  "${RESULT_DIR_3D}" \
     --samples_path "${SAMPLES}" \
+    --approximant  "${APPROXIMANT}" \
     --n_samples    5000 \
     --fmt          "${FMT}"
 
-#    --compare_dir  "${RESULTS_ROOT}/${EVENT}/lucky_strikes_zform" \
+gwbackpop-plot-event \
+    --results_dir  "${RESULT_DIR_3D}" \
+    --samples_path "${SAMPLES}" \
+    --approximant  "${APPROXIMANT}" \
+    --n_samples    5000 \
+    --fmt          "${FMT}"
 
-echo ">>> Plots done ($(elapsed ${T3}))"
+echo ">>> Plots done ($(elapsed "${T3}"))"
 
 # ---------------------------------------------------------------------------
 # Summary
@@ -277,9 +292,9 @@ echo ">>> Plots done ($(elapsed ${T3}))"
 echo ""
 echo "============================================================"
 echo " ${EVENT} complete."
-echo " Total wall time: $(elapsed ${SLURM_TASK_T0:-${T1}})"
+echo " Total wall time: $(elapsed "${T0}")"
 echo ""
 echo " Results:"
-echo "   ${RESULTS_ROOT}/${EVENT}/lucky_strikes/"
-#echo "   ${RESULTS_ROOT}/${EVENT}/lucky_strikes_zform/"
+echo "   ${RESULT_DIR_2D}/"
+echo "   ${RESULT_DIR_3D}/"
 echo "============================================================"
