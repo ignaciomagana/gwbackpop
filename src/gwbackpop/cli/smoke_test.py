@@ -60,8 +60,10 @@ def main() -> None:
         print(f"  cevars.alpha1 shape: {caps['cevars_alpha1_shape']}")
         print(f"  mtvars.acc_lim shape: {caps['mtvars_acc_lim_shape']}")
         print(f"  has se_flags: {caps['has_se_flags']}")
-        print(f"  evolv2 call convention: {caps['evolv2_call_convention'] or 'unknown until first call'}")
+        print(f"  evolv2 docstring first line: {caps['evolv2_docstring_first_line']}")
+        print(f"  selected evolv2 ABI convention: {caps['evolv2_call_convention'] or 'unknown until first call'}")
         print(f"  evolv2 return convention: {caps['evolv2_return_convention'] or 'unknown until first call'}")
+        print(f"  kick_info shape used: {caps['evolv2_kick_info_shape'] or 'unknown until first call'}")
 
 
 if __name__ == "__main__":
