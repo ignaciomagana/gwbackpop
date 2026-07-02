@@ -138,3 +138,48 @@ def test_vector_alpha_flim_capability_passes_independent_check(monkeypatch):
     assert caps["has_se_flags"] is True
     assert caps["evolv2_docstring_first_line"].startswith("zpars,kick_info")
     cosmic_mod.require_independent_alpha_flim_capability()
+
+
+def test_kick_columns_legacy_width_uses_exact_names(monkeypatch):
+    cosmic_mod = _install_fake_cosmic(monkeypatch, FakeEvolvebin25())
+    arr = np.zeros((2, 18))
+
+    assert cosmic_mod._kick_columns_for_array(arr) == cosmic_mod.KICK_COLUMNS
+
+
+def test_kick_dataframe_cosmic410_width_appends_one_extra_column(monkeypatch):
+    cosmic_mod = _install_fake_cosmic(monkeypatch, FakeEvolvebin410())
+    arr = np.zeros((2, 19))
+    arr[:, -1] = [10, 11]
+
+    kick_df = cosmic_mod._kick_dataframe_from_array(arr)
+
+    assert list(kick_df.columns) == cosmic_mod.KICK_COLUMNS + ["kick_info_extra_18"]
+    assert list(kick_df.index) == [10, 11]
+    assert kick_df.shape == (2, 19)
+
+
+def test_kick_dataframe_wider_width_appends_numbered_extra_columns(monkeypatch):
+    cosmic_mod = _install_fake_cosmic(monkeypatch, FakeEvolvebin410())
+    arr = np.zeros((2, 20))
+    arr[:, -1] = [20, 21]
+
+    kick_df = cosmic_mod._kick_dataframe_from_array(arr)
+
+    assert list(kick_df.columns) == cosmic_mod.KICK_COLUMNS + [
+        "kick_info_extra_18",
+        "kick_info_extra_19",
+    ]
+    assert list(kick_df.index) == [20, 21]
+    assert kick_df.shape == (2, 20)
+
+
+def test_kick_dataframe_weird_last_column_uses_default_range_index(monkeypatch):
+    cosmic_mod = _install_fake_cosmic(monkeypatch, FakeEvolvebin410())
+    arr = np.zeros((2, 19))
+    arr[:, -1] = [1.25, np.nan]
+
+    kick_df = cosmic_mod._kick_dataframe_from_array(arr)
+
+    assert list(kick_df.index) == [0, 1]
+    assert list(kick_df.columns)[-1] == "kick_info_extra_18"
