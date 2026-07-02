@@ -146,7 +146,7 @@ EVENT="${EVENTS[${SLURM_ARRAY_TASK_ID}]}"
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate "${CONDA_ENV}"
 
-for cmd in gwbackpop-run-event gwbackpop-plot; do
+for cmd in gwbackpop-run-event gwbackpop-plot-event; do
     if ! command -v "${cmd}" >/dev/null 2>&1; then
         echo "ERROR: ${cmd} not found after activating ${CONDA_ENV}."
         echo "Install with: python -m pip install -e '.[cosmic]' or activate the correct environment."
@@ -260,7 +260,7 @@ echo " [3/3]  Plotting"
 echo "─────────────────────────────────────────────────────────────"
 T3=$(date +%s)
 
-gwbackpop-plot \
+gwbackpop-plot-event \
     --results_dir  "${RESULTS_ROOT}/${EVENT}/lucky_strikes" \
     --samples_path "${SAMPLES}" \
     --n_samples    5000 \

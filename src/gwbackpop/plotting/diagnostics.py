@@ -44,6 +44,7 @@ import os
 import sys
 import warnings
 from argparse import ArgumentParser
+from pathlib import Path
 
 import numpy as np
 from gwbackpop.metadata import load_metadata_prefer_json
@@ -155,6 +156,71 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
+
+SINGLE_EVENT_REQUIRED_FILES = ("points.npy", "log_w.npy", "log_z.npy", "blobs.npy", "metadata.npz")
+HIERARCHICAL_REQUIRED_FILES = ("samples.npz", "summary.csv")
+
+
+def classify_results_dir(results_dir: str | os.PathLike[str]) -> str | None:
+    """Return the recognized BackPop result directory type, if any."""
+    path = Path(results_dir)
+    has_single_event = all((path / fname).is_file() for fname in SINGLE_EVENT_REQUIRED_FILES)
+    has_hierarchical = all((path / fname).is_file() for fname in HIERARCHICAL_REQUIRED_FILES)
+    if has_single_event:
+        return "single_event"
+    if has_hierarchical:
+        return "hierarchical"
+    return None
+
+
+def missing_required_files(results_dir: str | os.PathLike[str], required_files: tuple[str, ...]) -> list[str]:
+    """List required files that are absent from ``results_dir``."""
+    path = Path(results_dir)
+    return [fname for fname in required_files if not (path / fname).is_file()]
+
+
+def describe_hierarchical_outputs(results_dir: str | os.PathLike[str]) -> list[str]:
+    """Return user-facing descriptions of hierarchical artifacts already present."""
+    path = Path(results_dir)
+    outputs = [
+        ("corner_population.pdf", "population corner plot"),
+        ("population_distributions_95ci.pdf", "population distribution credible intervals"),
+        ("posteriors_CE_flim.pdf", "CE/flim posterior diagnostics"),
+        ("summary.csv", "population summary table"),
+        ("event_reweighting_diagnostics.csv", "event reweighting diagnostics"),
+        ("selection_weight_diagnostics.csv", "selection diagnostics"),
+    ]
+    return [f"{filename} ({description})" for filename, description in outputs if (path / filename).is_file()]
+
+
+def print_hierarchical_message(results_dir: str | os.PathLike[str]) -> None:
+    """Explain that a hierarchical directory was passed to the event plotter."""
+    print("[plot_backpop] Detected a hierarchical BackPop output directory.")
+    print("[plot_backpop] This command plots single-event BackPop diagnostics and will not load log_w.npy.")
+    print("[plot_backpop] Hierarchical runs already write population outputs in this directory:")
+    outputs = describe_hierarchical_outputs(results_dir)
+    if outputs:
+        for output in outputs:
+            print(f"  - {output}")
+    else:
+        print("  - samples.npz")
+        print("  - summary.csv")
+    print("[plot_backpop] To regenerate population plots, use gwbackpop-plot-hierarchical.")
+
+
+def validate_single_event_results_dir(results_dir: str | os.PathLike[str]) -> None:
+    """Raise a clear error if a single-event result directory is incomplete."""
+    missing = missing_required_files(results_dir, SINGLE_EVENT_REQUIRED_FILES)
+    if missing:
+        missing_list = ", ".join(missing)
+        required_list = ", ".join(SINGLE_EVENT_REQUIRED_FILES)
+        raise FileNotFoundError(
+            "Incomplete single-event BackPop result directory. "
+            f"Missing required file(s): {missing_list}. "
+            f"Expected: {required_list}. "
+            "If this is a hierarchical output directory, use gwbackpop-plot-hierarchical."
+        )
+
 
 def load_results(results_dir: str, n_samples: int = 10_000) -> dict:
     """Load and process posterior samples from a BackPop results directory.
@@ -656,7 +722,7 @@ def plot_2d_vs_3d_comparison(res_2d: dict, res_3d: dict, params_compare: list[st
 def parse_args():
     p = ArgumentParser(description="Plot BackPop posterior results.")
     p.add_argument("--results_dir",  required=True,
-                   help="Path to BackPop results directory.")
+                   help="Path to a single-event BackPop result directory. For hierarchical outputs, use gwbackpop-run-hierarchical outputs directly or gwbackpop-plot-hierarchical if available.")
     p.add_argument("--compare_dir",  default=None,
                    help="Optional second results directory for 2D vs 3D comparison.")
     p.add_argument("--samples_path", default=None,
@@ -688,6 +754,12 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
     fmt      = opts.fmt
     np.random.seed(42)
+
+    dir_type = classify_results_dir(opts.results_dir)
+    if dir_type == "hierarchical":
+        print_hierarchical_message(opts.results_dir)
+        return
+    validate_single_event_results_dir(opts.results_dir)
 
     print(f"[plot_backpop] Loading: {opts.results_dir}")
     res = load_results(opts.results_dir, n_samples=opts.n_samples)
