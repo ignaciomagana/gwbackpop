@@ -64,6 +64,7 @@ def main() -> None:
         print(f"  selected evolv2 ABI convention: {caps['evolv2_call_convention'] or 'unknown until first call'}")
         print(f"  evolv2 return convention: {caps['evolv2_return_convention'] or 'unknown until first call'}")
         print(f"  kick_info shape used: {caps['evolv2_kick_info_shape'] or 'unknown until first call'}")
+        print(f"  kick_info columns used: {caps['evolv2_kick_info_columns'] or 'unknown until first call'}")
 
 
 if __name__ == "__main__":

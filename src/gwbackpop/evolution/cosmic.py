@@ -63,6 +63,7 @@ _SE_FLAGS_MISSING_WARNED = False
 _EVOLV2_CALL_CONVENTION = None
 _EVOLV2_RETURN_LENGTH = None
 _EVOLV2_KICK_INFO_SHAPE = None
+_EVOLV2_KICK_INFO_COLUMNS = None
 
 _COSMIC410_DOC_SIGNATURE = "zpars,kick_info,bpp_index_out,bcm_index_out = evolv2"
 _COSMIC410_KICK_INFO_DOC = "kick_info : input rank-2 array('d') with bounds (2,19)"
@@ -214,6 +215,46 @@ KICK_COLUMNS = [
 # Fixed array shapes for Nautilus blob storage
 BPP_SHAPE = (25, len(COLS_KEEP))
 KICK_SHAPE = (2, len(KICK_COLUMNS))
+
+
+def _kick_columns_for_array(kick_info_arrays):
+    """Return kick_info DataFrame columns matching the live COSMIC array width."""
+    n_col = np.asarray(kick_info_arrays).shape[1]
+    if n_col == len(KICK_COLUMNS):
+        return KICK_COLUMNS
+    if n_col == len(KICK_COLUMNS) + 1:
+        return list(KICK_COLUMNS) + ["kick_info_extra_18"]
+    if n_col < len(KICK_COLUMNS):
+        return list(KICK_COLUMNS[:n_col])
+    return list(KICK_COLUMNS) + [
+        f"kick_info_extra_{i}" for i in range(len(KICK_COLUMNS), n_col)
+    ]
+
+
+def _kick_index_for_array(kick_info_arrays):
+    """Return an event/order index from the final column, or None if invalid."""
+    try:
+        last_col = np.asarray(kick_info_arrays)[:, -1]
+        if not np.all(np.isfinite(last_col)):
+            return None
+        if not np.all(np.isclose(last_col, np.rint(last_col))):
+            return None
+        idx = last_col.astype(int)
+        if len(np.unique(idx)) != len(idx):
+            return None
+        return idx
+    except Exception:
+        return None
+
+
+def _kick_dataframe_from_array(kick_info_arrays):
+    """Build a robust kick_info DataFrame across COSMIC ABI widths."""
+    kick_cols = _kick_columns_for_array(kick_info_arrays)
+    kick_df = pd.DataFrame(kick_info_arrays, columns=kick_cols)
+    idx = _kick_index_for_array(kick_info_arrays)
+    if idx is not None:
+        kick_df.index = idx
+    return kick_df
 
 
 # ---------------------------------------------------------------------------
@@ -760,6 +801,7 @@ def get_cosmic_capabilities(
     except metadata.PackageNotFoundError:
         cosmic_version = None
     kick_info_shape = _EVOLV2_KICK_INFO_SHAPE
+    kick_info_columns = _EVOLV2_KICK_INFO_COLUMNS
     if kick_info_shape is None and evolv2_call_convention is not None:
         kick_info_shape = _kick_info_shape_for_abi(evolv2_call_convention)
     return {
@@ -773,6 +815,7 @@ def get_cosmic_capabilities(
             None if evolv2_return_length is None else f"len={evolv2_return_length}"
         ),
         "evolv2_kick_info_shape": kick_info_shape,
+        "evolv2_kick_info_columns": kick_info_columns,
     }
 
 
@@ -913,10 +956,12 @@ def evolv2(
     bpp_index, bcm_index, kick_info_arrays, evolv2_return_length = _parse_evolv2_return(
         evolv2_out, evolv2_call_convention, kick_info
     )
-    global _EVOLV2_CALL_CONVENTION, _EVOLV2_RETURN_LENGTH, _EVOLV2_KICK_INFO_SHAPE
+    global _EVOLV2_CALL_CONVENTION, _EVOLV2_RETURN_LENGTH
+    global _EVOLV2_KICK_INFO_SHAPE, _EVOLV2_KICK_INFO_COLUMNS
     _EVOLV2_CALL_CONVENTION = evolv2_call_convention
     _EVOLV2_RETURN_LENGTH = evolv2_return_length
-    _EVOLV2_KICK_INFO_SHAPE = tuple(kick_info.shape)
+    _EVOLV2_KICK_INFO_SHAPE = tuple(np.asarray(kick_info_arrays).shape)
+    _EVOLV2_KICK_INFO_COLUMNS = _kick_columns_for_array(kick_info_arrays)
 
     # ---- Extract and clear output arrays (avoids Fortran global state leakage) ----
     bpp_raw = _evolvebin.binary.bpp[:25, :n_col_bpp].copy()
@@ -927,11 +972,7 @@ def evolv2(
 
     # ---- Build DataFrames ----
     bpp = pd.DataFrame(bpp_raw, columns=BPP_COLUMNS)[COLS_KEEP]
-    kick_df = pd.DataFrame(
-        kick_info_arrays,
-        columns=KICK_COLUMNS,
-        index=kick_info_arrays[:, -1].astype(int),
-    )
+    kick_df = _kick_dataframe_from_array(kick_info_arrays)
 
     # ---- Find merger row: BBH (kstar=14/14) that inspirals (evol_type=3) ----
     merger_mask = (
@@ -945,9 +986,7 @@ def evolv2(
 
     final_state = merger_rows[params_out].iloc[0]
     bpp_array   = bpp.to_numpy()
-    kick_array  = kick_df.to_numpy()
-
-    return final_state, bpp_array, kick_array
+    return final_state, bpp_array, kick_df
 
 
 # ---------------------------------------------------------------------------
