@@ -49,6 +49,7 @@ REFACTORING / CLARITY
 from __future__ import annotations
 
 import warnings
+from importlib import metadata
 
 import numpy as np
 import pandas as pd
@@ -59,6 +60,8 @@ from cosmic import _evolvebin
 
 
 _SE_FLAGS_MISSING_WARNED = False
+_EVOLV2_CALL_CONVENTION = None
+_EVOLV2_RETURN_LENGTH = None
 
 
 def _set_optional_attr(obj, attr: str, value, context: str) -> bool:
@@ -588,6 +591,88 @@ def set_evolvebin_flags(flags: dict) -> None:
         _SE_FLAGS_MISSING_WARNED = True
 
 
+def _is_evolv2_argument_count_typeerror(exc: TypeError) -> bool:
+    """Return True when a TypeError came from an evolv2 ABI arity mismatch."""
+    message = str(exc)
+    argument_count_phrases = (
+        "argument",
+        "arguments",
+        "positional",
+        "given",
+        "takes at most",
+        "takes exactly",
+        "takes from",
+        "expected",
+        "required positional",
+    )
+    return (
+        ("argument" in message or "positional" in message)
+        and any(phrase in message for phrase in argument_count_phrases)
+    )
+
+
+def _call_evolv2_with_supported_abi(evolvebin, evolv2_args_24: tuple, kick_info):
+    """Call COSMIC evolv2 across known 24-arg and 25-arg f2py ABIs.
+
+    cosmic-popsynth 4.1.0 accepts 24 positional arguments and returns kick
+    information, while older builds accept a 25th in-place ``kick_info`` array.
+    Only retry TypeErrors that look like argument-count mismatches; TypeErrors
+    raised from inside COSMIC should propagate unchanged.
+    """
+    try:
+        return evolvebin.evolv2(*evolv2_args_24), "24-arg"
+    except TypeError as exc:
+        if not _is_evolv2_argument_count_typeerror(exc):
+            raise
+        return evolvebin.evolv2(*evolv2_args_24, kick_info), "25-arg"
+
+
+def _shape_or_none(value):
+    try:
+        return tuple(np.asarray(value).shape)
+    except Exception:
+        return None
+
+
+def get_cosmic_capabilities(
+    *,
+    evolv2_call_convention: str | None = None,
+    evolv2_return_length: int | None = None,
+) -> dict:
+    """Return runtime COSMIC ABI/capability diagnostics for doctor output."""
+    if evolv2_call_convention is None:
+        evolv2_call_convention = _EVOLV2_CALL_CONVENTION
+    if evolv2_return_length is None:
+        evolv2_return_length = _EVOLV2_RETURN_LENGTH
+
+    try:
+        cosmic_version = metadata.version("cosmic-popsynth")
+    except metadata.PackageNotFoundError:
+        cosmic_version = None
+    return {
+        "cosmic_popsynth_version": cosmic_version,
+        "cevars_alpha1_shape": _shape_or_none(getattr(_evolvebin.cevars, "alpha1", None)),
+        "mtvars_acc_lim_shape": _shape_or_none(getattr(_evolvebin.mtvars, "acc_lim", None)),
+        "has_se_flags": hasattr(_evolvebin, "se_flags"),
+        "evolv2_call_convention": evolv2_call_convention,
+        "evolv2_return_convention": (
+            None if evolv2_return_length is None else f"len={evolv2_return_length}"
+        ),
+    }
+
+
+def require_independent_alpha_flim_capability() -> None:
+    """Raise if the COSMIC build cannot represent independent alpha/flim pairs."""
+    caps = get_cosmic_capabilities()
+    if caps["cevars_alpha1_shape"] != (2,) or caps["mtvars_acc_lim_shape"] != (2,):
+        raise RuntimeError(
+            "COSMIC build does not support independent alpha_1/alpha_2 and "
+            "flim_1/flim_2: "
+            f"cevars.alpha1 shape={caps['cevars_alpha1_shape']}, "
+            f"mtvars.acc_lim shape={caps['mtvars_acc_lim_shape']}"
+        )
+
+
 # ---------------------------------------------------------------------------
 # COSMIC binary evolution call
 # ---------------------------------------------------------------------------
@@ -702,12 +787,19 @@ def evolv2(
     #   4-return: (_, bpp_index, bcm_index, kick_info_arrays)
     #   3-return: (bpp_index, bcm_index, kick_info_arrays)
     #   3-return older fallback: (_, bpp_index, bcm_index), with kick_info filled in-place.
-    evolv2_out = _evolvebin.evolv2(
+    evolv2_args_24 = (
         kstar, mass, tb, e, metallicity, tphysf,
         dtp, mass0, rad, lumin, massc, radc,
         menv, renv, ospin, B_0, bacc, tacc, epoch, tms,
-        bhspin, tphys, zpars, bkick, kick_info,
+        bhspin, tphys, zpars, bkick,
     )
+    evolv2_out, evolv2_call_convention = _call_evolv2_with_supported_abi(
+        _evolvebin, evolv2_args_24, kick_info
+    )
+    evolv2_return_length = len(evolv2_out)
+    global _EVOLV2_CALL_CONVENTION, _EVOLV2_RETURN_LENGTH
+    _EVOLV2_CALL_CONVENTION = evolv2_call_convention
+    _EVOLV2_RETURN_LENGTH = evolv2_return_length
 
     def _scalar_int(x, name):
         arr = np.asarray(x)
@@ -720,9 +812,9 @@ def evolv2(
             f"shape={arr.shape}, dtype={arr.dtype}"
         )
 
-    if len(evolv2_out) == 4:
+    if evolv2_return_length == 4:
         _, bpp_index, bcm_index, kick_info_arrays = evolv2_out
-    elif len(evolv2_out) == 3:
+    elif evolv2_return_length == 3:
         a, b, c = evolv2_out
         # Most COSMIC 3.x builds return (bpp_index, bcm_index, kick_info_arrays).
         # If that is not true, fall back to (_, bpp_index, bcm_index).
@@ -735,7 +827,7 @@ def evolv2(
             kick_info_arrays = kick_info
     else:
         raise RuntimeError(
-            f"Unexpected COSMIC evolv2 return length: {len(evolv2_out)}"
+            f"Unexpected COSMIC evolv2 return length: {evolv2_return_length}"
         )
 
     bpp_index = _scalar_int(bpp_index, "bpp_index")
