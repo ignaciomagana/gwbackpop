@@ -72,6 +72,7 @@ from multiprocessing import Pool, cpu_count
 from scipy.stats import maxwell, beta as beta_dist, lognorm
 from scipy.special import logsumexp
 from gwbackpop.metadata import base_runtime_metadata, get_package_versions, save_metadata
+from gwbackpop.population.constants import POP_PARAM_NAMES
 
 # ---------------------------------------------------------------------------
 # Default parameter space is loaded from gwbackpop.config.get_backpop_config().
@@ -162,8 +163,6 @@ def _failure(reason: str, **extra) -> dict | None:
 
 def load_hyperposterior_samples(path: str) -> np.ndarray:
     """Load posterior samples in POP_PARAM_NAMES order from a no-selection run."""
-    from gwbackpop.inference.hierarchical import POP_PARAM_NAMES
-
     data = np.load(path, allow_pickle=True)
     if "samples" in data.files:
         arr = np.asarray(data["samples"], dtype=np.float64)
@@ -206,8 +205,6 @@ def _truncated_lognormal_logpdf(x, mu: float, sig: float, lo: float, hi: float):
 
 
 def _component_logpdf_theta(theta: np.ndarray, component: np.ndarray) -> float:
-    from gwbackpop.inference.hierarchical import POP_PARAM_NAMES
-
     hp = dict(zip(POP_PARAM_NAMES, np.asarray(component, dtype=np.float64)))
     logp = 0.0
     for name, mu, sig in (("alpha_1", hp["mu_logalpha1"], hp["sig_logalpha1"]),
@@ -260,7 +257,6 @@ def _draw_theta_adaptive(rng: np.random.Generator) -> np.ndarray:
                 i = PARAMS.index(kick_name)
                 theta[i] = _draw_truncated_maxwell(rng, KICK_PROPOSAL_SIGMA, LOWER[i], UPPER[i])
         return theta
-    from gwbackpop.inference.hierarchical import POP_PARAM_NAMES
     hp = dict(zip(POP_PARAM_NAMES, HYPERPOSTERIOR_COMPONENTS[rng.integers(len(HYPERPOSTERIOR_COMPONENTS))]))
     for name, mu, sig in (("alpha_1", hp["mu_logalpha1"], hp["sig_logalpha1"]),
                           ("alpha_2", hp["mu_logalpha2"], hp["sig_logalpha2"])):
@@ -729,6 +725,9 @@ def run_campaign(
     print(f"[injections] proposal_mode: {PROPOSAL_MODE}")
     print(f"[injections] pdet: {pdet_path_resolved}")
     print(f"[injections] output: {output_path}")
+    if "jax" in sys.modules:
+        print("[injections] WARNING: jax is already imported before multiprocessing fork; "
+              "JAX is multithreaded and may emit os.fork RuntimeWarning.")
     print()
 
     with Pool(

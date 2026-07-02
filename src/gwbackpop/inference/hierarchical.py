@@ -109,6 +109,7 @@ from numpyro.infer import NUTS, MCMC
 from numpyro.diagnostics import print_summary, effective_sample_size, gelman_rubin
 
 from gwbackpop.metadata import base_runtime_metadata, get_package_versions, save_metadata
+from gwbackpop.population.constants import POP_PARAM_NAMES
 
 
 def str2bool(value):
@@ -143,7 +144,6 @@ HYPERPARAM_INFO = [
     dict(name="sigma_v2",      default=150.0, prior="5.0 + HalfNormal(150.0)"),
 ]
 
-POP_PARAM_NAMES = [p["name"] for p in HYPERPARAM_INFO]
 HYPERPRIOR_DESCRIPTIONS = {p["name"]: p["prior"] for p in HYPERPARAM_INFO}
 
 # Conservative positive floors used inside the NumPyro model to keep scale
