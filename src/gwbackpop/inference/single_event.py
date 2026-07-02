@@ -117,6 +117,10 @@ from gwbackpop.cosmology import (
     z_merger_from_t_delay,
 )
 from gwbackpop.metadata import base_runtime_metadata, get_package_versions, save_metadata
+from gwbackpop.evolution.cosmic_capabilities import (
+    inspect_cosmic_capabilities,
+    require_supported_cosmic_for_independent_alpha_flim,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -520,6 +524,10 @@ def main():
     lower_bound, upper_bound, params_in_names, fixed_params = get_backpop_config(
         opts.config_name
     )
+    require_supported_cosmic_for_independent_alpha_flim(
+        config_name=opts.config_name,
+        params=params_in_names,
+    )
     prior = Prior()
     for name, lo, hi in zip(params_in_names, lower_bound, upper_bound):
         prior.add_parameter(name, dist=(lo, hi))
@@ -617,9 +625,16 @@ def main():
         os.remove(checkpoint)
         print(f"[run_backpop] Checkpoint deleted: {checkpoint}")
 
+    cosmic_capabilities = inspect_cosmic_capabilities()
     metadata = dict(
         **base_runtime_metadata("."),
         package_versions=get_package_versions(["numpy", "scipy", "astropy", "nautilus", "pesummary", "cosmic"]),
+        cosmic_capabilities=cosmic_capabilities,
+        cosmic_popsynth_version=cosmic_capabilities["cosmic_popsynth_version"],
+        supports_independent_alpha=cosmic_capabilities["supports_independent_alpha"],
+        supports_independent_flim=cosmic_capabilities["supports_independent_flim"],
+        supports_cosmic410_evolv2_signature=cosmic_capabilities["supports_cosmic410_evolv2_signature"],
+        supported_for_independent_alpha_flim=cosmic_capabilities["supported_for_independent_alpha_flim"],
         event_name              = opts.event_name,
         config_name             = opts.config_name,
         likelihood_mode         = mode_tag,

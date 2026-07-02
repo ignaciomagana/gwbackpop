@@ -39,7 +39,24 @@ class _FakePool:
         ]
 
 
+def _fake_supported_cosmic(monkeypatch):
+    caps = {
+        "cosmic_popsynth_version": "4.1.0",
+        "supports_independent_alpha": True,
+        "supports_independent_flim": True,
+        "supports_cosmic410_evolv2_signature": True,
+        "supported_for_independent_alpha_flim": True,
+    }
+    monkeypatch.setattr(run_injections, "inspect_cosmic_capabilities", lambda: caps)
+    monkeypatch.setattr(
+        run_injections,
+        "require_supported_cosmic_for_independent_alpha_flim",
+        lambda config_name=None, params=None: None,
+    )
+
+
 def test_saved_injection_bounds_match_backpop_config(tmp_path, monkeypatch):
+    _fake_supported_cosmic(monkeypatch)
     monkeypatch.setattr(run_injections, "Pool", _FakePool)
     output_path = tmp_path / "injections.npz"
 
@@ -66,6 +83,7 @@ def test_saved_injection_bounds_match_backpop_config(tmp_path, monkeypatch):
 
 
 def test_run_campaign_accepts_debug_failures(tmp_path, monkeypatch):
+    _fake_supported_cosmic(monkeypatch)
     _FakePool.initargs = ()
     monkeypatch.setattr(run_injections, "Pool", _FakePool)
     output_path = tmp_path / "injections.npz"
@@ -80,4 +98,4 @@ def test_run_campaign_accepts_debug_failures(tmp_path, monkeypatch):
     )
 
     assert run_injections.DEBUG_FAILURES is True
-    assert _FakePool.initargs[-1] is True
+    assert _FakePool.initargs[4] is True
