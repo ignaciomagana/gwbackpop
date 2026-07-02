@@ -910,6 +910,13 @@ def make_numpyro_model(
 
 
 
+
+def _integrate_trapezoid(y, x):
+    """Compatibility wrapper for NumPy versions with trapz or trapezoid."""
+    if hasattr(np, "trapezoid"):
+        return np.trapezoid(y, x)
+    return np.trapz(y, x)
+
 def _npz_scalar(npz, key, default=None):
     if key not in npz:
         return default
@@ -1444,6 +1451,65 @@ def compute_direct_pdet_selection_weight_diagnostics(lp_vec: np.ndarray, label: 
     else: top_1 = top_0p1 = np.nan
     return dict(hyperpoint=label, selection_mode="direct_pdet", injection_count_total=int(cosmic["N_inj"]), merging_injection_count=int(cosmic["N_merge"]), finite_pdet_count=int(np.isfinite(pdet).sum()), positive_pdet_count=int((pdet > 0.0).sum()), positive_contribution_count=int(contrib.size), injection_ess=summary["ess"], ess_fraction=summary["ess_fraction"], max_contribution=summary["max_normalized_weight"], top_1pct_alpha_fraction=float(top_1), top_0p1pct_alpha_fraction=float(top_0p1), warning=summary["warning"])
 
+
+def validate_selection_mc_diagnostics(
+    rows: list[dict],
+    min_selection_ess: float = 100.0,
+    min_selection_ess_fraction: float = 1e-3,
+    max_selection_top1_fraction: float = 0.5,
+    max_selection_top0p1_fraction: float = 0.2,
+    labels: set[str] | None = None,
+) -> tuple[bool, str]:
+    """Validate hard selection-MC quality gates for alpha diagnostics."""
+    failures: list[str] = []
+    selected_rows = [row for row in rows if labels is None or row.get("hyperpoint") in labels]
+    for row in selected_rows:
+        label = str(row.get("hyperpoint", "unknown"))
+        ess = float(row.get("injection_ess", np.nan))
+        ess_fraction = float(row.get("ess_fraction", np.nan))
+        top1 = float(row.get("top_1pct_alpha_fraction", np.nan))
+        top0p1 = float(row.get("top_0p1pct_alpha_fraction", np.nan))
+        if (not np.isfinite(ess)) or ess < min_selection_ess:
+            failures.append(f"{label}: selection ESS {ess:.6g} < {min_selection_ess:.6g}")
+        if (not np.isfinite(ess_fraction)) or ess_fraction < min_selection_ess_fraction:
+            failures.append(f"{label}: selection ESS/N {ess_fraction:.6g} < {min_selection_ess_fraction:.6g}")
+        if (not np.isfinite(top1)) or top1 > max_selection_top1_fraction:
+            failures.append(f"{label}: top 1% alpha fraction {top1:.6g} > {max_selection_top1_fraction:.6g}")
+        if (not np.isfinite(top0p1)) or top0p1 > max_selection_top0p1_fraction:
+            failures.append(f"{label}: top 0.1% alpha fraction {top0p1:.6g} > {max_selection_top0p1_fraction:.6g}")
+    return (len(failures) == 0, "; ".join(failures))
+
+
+def handle_selection_mc_quality_gates(
+    rows: list[dict],
+    *,
+    min_selection_ess: float = 100.0,
+    min_selection_ess_fraction: float = 1e-3,
+    max_selection_top1_fraction: float = 0.5,
+    max_selection_top0p1_fraction: float = 0.2,
+    allow_bad_selection_mc: bool = False,
+    labels: set[str] | None = None,
+    context: str = "selection diagnostics",
+) -> tuple[bool, str]:
+    """Apply selection-MC quality gates, optionally warning instead of raising."""
+    valid, reason = validate_selection_mc_diagnostics(
+        rows,
+        min_selection_ess=min_selection_ess,
+        min_selection_ess_fraction=min_selection_ess_fraction,
+        max_selection_top1_fraction=max_selection_top1_fraction,
+        max_selection_top0p1_fraction=max_selection_top0p1_fraction,
+        labels=labels,
+    )
+    if valid:
+        return True, ""
+    message = f"Selection-MC quality gates failed during {context}: {reason}"
+    if allow_bad_selection_mc:
+        warning = "\n" + "!" * 78 + "\nPROMINENT WARNING: " + message + "\nOutputs will be marked selection_mc_valid=False.\n" + "!" * 78
+        print(warning)
+        warnings.warn(message, RuntimeWarning)
+        return False, reason
+    raise ValueError(message + "; pass --allow_bad_selection_mc True to override and mark outputs invalid.")
+
 def print_selection_weight_diagnostics(rows: list[dict]) -> None:
     """Print selection-integral contribution diagnostics."""
     if not rows:
@@ -1532,6 +1598,16 @@ def parse_args():
                      help="Fail instead of warning when LVK HDF5 metadata does not verify that sampling_pdf is in d(mass1_source) d(mass2_source) d(redshift).")
     sel.add_argument("--allow_inconsistent_selection_model", type=str2bool, default=False,
                      help="Explicitly allow event posterior and injection metadata to use different base measures. Intended only for legacy diagnostics.")
+    sel.add_argument("--min_selection_ess", type=float, default=100.0,
+                     help="Minimum allowed selection-injection ESS at diagnostic hyperpoints.")
+    sel.add_argument("--min_selection_ess_fraction", type=float, default=1e-3,
+                     help="Minimum allowed selection-injection ESS divided by diagnostic contribution count.")
+    sel.add_argument("--max_selection_top1_fraction", type=float, default=0.5,
+                     help="Maximum allowed fraction of alpha contributed by the top 1%% of selection weights.")
+    sel.add_argument("--max_selection_top0p1_fraction", type=float, default=0.2,
+                     help="Maximum allowed fraction of alpha contributed by the top 0.1%% of selection weights.")
+    sel.add_argument("--allow_bad_selection_mc", type=str2bool, default=False,
+                     help="Continue despite failing selection-MC diagnostics; outputs are marked invalid in metadata.")
 
     stab = p.add_argument_group("NumPyro stabilization")
     stab.add_argument("--sig_logalpha_floor", type=float, default=DEFAULT_SIG_LOGALPHA_FLOOR,
@@ -1907,12 +1983,24 @@ def main():
     print(f"  Event reweighting diagnostics CSV: {event_diag_path}")
 
     selection_diagnostic_rows = []
+    selection_mc_valid = True
+    selection_mc_failure_reason = ""
     if selection_mode == "direct_pdet" and cosmic is not None:
         selection_diagnostic_rows.append(compute_direct_pdet_selection_weight_diagnostics(np.asarray(dummy_lp), "default_pre_nuts", cosmic))
         print_selection_weight_diagnostics(selection_diagnostic_rows)
         selection_diag_path = os.path.join(out_dir, "selection_weight_diagnostics.csv")
         write_selection_weight_diagnostics_csv(selection_diag_path, selection_diagnostic_rows)
         print(f"  Selection diagnostics CSV: {selection_diag_path}")
+        selection_mc_valid, selection_mc_failure_reason = handle_selection_mc_quality_gates(
+            selection_diagnostic_rows,
+            min_selection_ess=opts.min_selection_ess,
+            min_selection_ess_fraction=opts.min_selection_ess_fraction,
+            max_selection_top1_fraction=opts.max_selection_top1_fraction,
+            max_selection_top0p1_fraction=opts.max_selection_top0p1_fraction,
+            allow_bad_selection_mc=opts.allow_bad_selection_mc,
+            labels={"default_pre_nuts"},
+            context="default_pre_nuts",
+        )
     elif selection_mode == "lvk_farr" and K_np is not None and cosmic is not None:
         selection_diagnostic_rows.append(compute_selection_weight_diagnostics(
             np.asarray(dummy_lp), "default_pre_nuts", K_np, log_v, cosmic
@@ -1923,6 +2011,16 @@ def main():
             selection_diag_path, selection_diagnostic_rows
         )
         print(f"  Selection diagnostics CSV: {selection_diag_path}")
+        selection_mc_valid, selection_mc_failure_reason = handle_selection_mc_quality_gates(
+            selection_diagnostic_rows,
+            min_selection_ess=opts.min_selection_ess,
+            min_selection_ess_fraction=opts.min_selection_ess_fraction,
+            max_selection_top1_fraction=opts.max_selection_top1_fraction,
+            max_selection_top0p1_fraction=opts.max_selection_top0p1_fraction,
+            allow_bad_selection_mc=opts.allow_bad_selection_mc,
+            labels={"default_pre_nuts"},
+            context="default_pre_nuts",
+        )
 
     model = make_numpyro_model(
         log_likelihood_fn,
@@ -2018,6 +2116,24 @@ def main():
                     flat_samples[idx], f"posterior_draw_{j:03d}", K_np, log_v, cosmic
                 ))
         print_selection_weight_diagnostics(selection_diagnostic_rows)
+
+    if selection_diagnostic_rows:
+        post_valid, post_reason = validate_selection_mc_diagnostics(
+            selection_diagnostic_rows,
+            min_selection_ess=opts.min_selection_ess,
+            min_selection_ess_fraction=opts.min_selection_ess_fraction,
+            max_selection_top1_fraction=opts.max_selection_top1_fraction,
+            max_selection_top0p1_fraction=opts.max_selection_top0p1_fraction,
+            labels={"posterior_median"} | {f"posterior_draw_{j:03d}" for j in range(n_diag_draws)},
+        )
+        if not post_valid:
+            selection_mc_valid = False
+            selection_mc_failure_reason = "; ".join(filter(None, [selection_mc_failure_reason, post_reason]))
+            print("\n" + "!" * 78)
+            print("PROMINENT WARNING: posterior selection-MC diagnostics failed quality gates.")
+            print(f"Reason: {post_reason}")
+            print("Outputs will be marked selection_mc_valid=False.")
+            print("!" * 78)
 
     # ---- Save core outputs ----
     print(f"\n Saving to {out_dir}/...")
@@ -2301,7 +2417,7 @@ def main():
             return default_lo, default_hi
 
         def _normalize_pdf(pdf, grid):
-            area = np.trapz(pdf, grid)
+            area = _integrate_trapezoid(pdf, grid)
             if np.isfinite(area) and area > 0.0:
                 return pdf / area
             return pdf
@@ -2505,6 +2621,13 @@ def main():
         selection_mode   = selection_mode,
         selection_uses_direct_pdet = selection_mode == "direct_pdet",
         selection_uses_lvk_farr = selection_mode == "lvk_farr",
+        selection_mc_valid = bool(selection_mc_valid),
+        selection_mc_failure_reason = str(selection_mc_failure_reason),
+        min_selection_ess = float(opts.min_selection_ess),
+        min_selection_ess_fraction = float(opts.min_selection_ess_fraction),
+        max_selection_top1_fraction = float(opts.max_selection_top1_fraction),
+        max_selection_top0p1_fraction = float(opts.max_selection_top0p1_fraction),
+        allow_bad_selection_mc = bool(opts.allow_bad_selection_mc),
         direct_pdet_requires_finite_pdet = selection_mode == "direct_pdet",
         direct_pdet_positive_count = int(np.sum(cosmic.get("pdet") > 0.0)) if selection_mode == "direct_pdet" and cosmic is not None and cosmic.get("pdet") is not None else 0,
         direct_pdet_finite_count = int(np.sum(np.isfinite(cosmic.get("pdet")))) if selection_mode == "direct_pdet" and cosmic is not None and cosmic.get("pdet") is not None else 0,
