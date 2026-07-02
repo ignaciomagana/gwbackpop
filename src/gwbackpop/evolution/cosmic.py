@@ -62,6 +62,10 @@ from cosmic import _evolvebin
 _SE_FLAGS_MISSING_WARNED = False
 _EVOLV2_CALL_CONVENTION = None
 _EVOLV2_RETURN_LENGTH = None
+_EVOLV2_KICK_INFO_SHAPE = None
+
+_COSMIC410_DOC_SIGNATURE = "zpars,kick_info,bpp_index_out,bcm_index_out = evolv2"
+_COSMIC410_KICK_INFO_DOC = "kick_info : input rank-2 array('d') with bounds (2,19)"
 
 
 def _set_optional_attr(obj, attr: str, value, context: str) -> bool:
@@ -611,20 +615,126 @@ def _is_evolv2_argument_count_typeerror(exc: TypeError) -> bool:
     )
 
 
-def _call_evolv2_with_supported_abi(evolvebin, evolv2_args_24: tuple, kick_info):
-    """Call COSMIC evolv2 across known 24-arg and 25-arg f2py ABIs.
+def _evolv2_docstring(evolvebin=_evolvebin) -> str:
+    """Return the f2py docstring for the live COSMIC evolv2 function."""
+    return getattr(getattr(evolvebin, "evolv2", None), "__doc__", None) or ""
 
-    cosmic-popsynth 4.1.0 accepts 24 positional arguments and returns kick
-    information, while older builds accept a 25th in-place ``kick_info`` array.
-    Only retry TypeErrors that look like argument-count mismatches; TypeErrors
-    raised from inside COSMIC should propagate unchanged.
+
+def _evolv2_docstring_first_line(evolvebin=_evolvebin) -> str | None:
+    """Return the first non-empty line of the live evolv2 docstring."""
+    for line in _evolv2_docstring(evolvebin).splitlines():
+        stripped = line.strip()
+        if stripped:
+            return stripped
+    return None
+
+
+def _docstring_declares_cosmic410_24(evolvebin=_evolvebin) -> bool:
+    """Return True when f2py metadata matches the COSMIC 4.1.0 evolv2 ABI."""
+    doc = _evolv2_docstring(evolvebin)
+    normalized = " ".join(doc.split())
+    return (
+        _COSMIC410_DOC_SIGNATURE in normalized
+        and _COSMIC410_KICK_INFO_DOC in normalized
+    )
+
+
+def _select_evolv2_abi(evolvebin=_evolvebin) -> str:
+    """Select and cache the known evolv2 ABI convention for this process."""
+    global _EVOLV2_CALL_CONVENTION
+    if _EVOLV2_CALL_CONVENTION is not None:
+        return _EVOLV2_CALL_CONVENTION
+    if _docstring_declares_cosmic410_24(evolvebin):
+        _EVOLV2_CALL_CONVENTION = "cosmic410_24"
+    else:
+        _EVOLV2_CALL_CONVENTION = "legacy_25"
+    return _EVOLV2_CALL_CONVENTION
+
+
+def _kick_info_shape_for_abi(convention: str) -> tuple[int, int]:
+    if convention == "cosmic410_24":
+        return (2, 19)
+    if convention == "legacy_25":
+        return (2, 18)
+    raise ValueError(f"Unknown COSMIC evolv2 ABI convention: {convention}")
+
+
+def _call_evolv2_with_supported_abi(
+    evolvebin,
+    evolv2_args_cosmic410_24: tuple,
+    bkick,
+    kick_info,
+    convention: str | None = None,
+):
+    """Call COSMIC evolv2 using the selected, convention-aware ABI.
+
+    ``cosmic410_24`` is the COSMIC 4.1.0 f2py ABI:
+    (..., bhspin, tphys, zpars, kick_info_2x19).  It has no ``bkick``
+    argument and returns ``(zpars, kick_info, bpp_index, bcm_index)``.
+
+    ``legacy_25`` preserves the older ABI:
+    (..., bhspin, tphys, zpars, bkick, kick_info_2x18_or_existing).
     """
-    try:
-        return evolvebin.evolv2(*evolv2_args_24), "24-arg"
-    except TypeError as exc:
-        if not _is_evolv2_argument_count_typeerror(exc):
-            raise
-        return evolvebin.evolv2(*evolv2_args_24, kick_info), "25-arg"
+    if convention is None:
+        convention = _select_evolv2_abi(evolvebin)
+
+    if convention == "cosmic410_24":
+        return evolvebin.evolv2(*evolv2_args_cosmic410_24), convention
+
+    if convention != "legacy_25":
+        raise ValueError(f"Unknown COSMIC evolv2 ABI convention: {convention}")
+
+    legacy_args = (*evolv2_args_cosmic410_24[:-1], bkick, kick_info)
+    return evolvebin.evolv2(*legacy_args), convention
+
+
+def _parse_evolv2_return(evolv2_out, convention: str, kick_info):
+    """Parse COSMIC evolv2 output into (bpp_index, bcm_index, kick_info)."""
+    evolv2_return_length = len(evolv2_out)
+
+    def _scalar_int(x, name):
+        arr = np.asarray(x)
+        if arr.shape == ():
+            return int(arr)
+        if arr.size == 1:
+            return int(arr.ravel()[0])
+        raise TypeError(
+            f"COSMIC returned non-scalar {name}: "
+            f"shape={arr.shape}, dtype={arr.dtype}"
+        )
+
+    if convention == "cosmic410_24":
+        if evolv2_return_length != 4:
+            raise RuntimeError(
+                "COSMIC cosmic410_24 evolv2 returned "
+                f"{evolv2_return_length} values, expected 4."
+            )
+        _zpars_out, kick_info_arrays, bpp_index, bcm_index = evolv2_out
+    elif convention == "legacy_25":
+        if evolv2_return_length == 4:
+            _, bpp_index, bcm_index, kick_info_arrays = evolv2_out
+        elif evolv2_return_length == 3:
+            a, b, c = evolv2_out
+            try:
+                bpp_index = _scalar_int(a, "bpp_index")
+                bcm_index = _scalar_int(b, "bcm_index")
+                kick_info_arrays = c
+            except TypeError:
+                _, bpp_index, bcm_index = evolv2_out
+                kick_info_arrays = kick_info
+        else:
+            raise RuntimeError(
+                f"Unexpected COSMIC evolv2 return length: {evolv2_return_length}"
+            )
+    else:
+        raise ValueError(f"Unknown COSMIC evolv2 ABI convention: {convention}")
+
+    return (
+        _scalar_int(bpp_index, "bpp_index"),
+        _scalar_int(bcm_index, "bcm_index"),
+        np.asarray(kick_info_arrays),
+        evolv2_return_length,
+    )
 
 
 def _shape_or_none(value):
@@ -649,15 +759,20 @@ def get_cosmic_capabilities(
         cosmic_version = metadata.version("cosmic-popsynth")
     except metadata.PackageNotFoundError:
         cosmic_version = None
+    kick_info_shape = _EVOLV2_KICK_INFO_SHAPE
+    if kick_info_shape is None and evolv2_call_convention is not None:
+        kick_info_shape = _kick_info_shape_for_abi(evolv2_call_convention)
     return {
         "cosmic_popsynth_version": cosmic_version,
         "cevars_alpha1_shape": _shape_or_none(getattr(_evolvebin.cevars, "alpha1", None)),
         "mtvars_acc_lim_shape": _shape_or_none(getattr(_evolvebin.mtvars, "acc_lim", None)),
         "has_se_flags": hasattr(_evolvebin, "se_flags"),
+        "evolv2_docstring_first_line": _evolv2_docstring_first_line(_evolvebin),
         "evolv2_call_convention": evolv2_call_convention,
         "evolv2_return_convention": (
             None if evolv2_return_length is None else f"len={evolv2_return_length}"
         ),
+        "evolv2_kick_info_shape": kick_info_shape,
     }
 
 
@@ -779,59 +894,29 @@ def evolv2(
     bhspin   = np.zeros(2)
     zpars    = np.zeros(20)
     bkick    = np.zeros(20)
-    kick_info = np.zeros((2, 18))
+    evolv2_call_convention = _select_evolv2_abi(_evolvebin)
+    kick_info = np.zeros(_kick_info_shape_for_abi(evolv2_call_convention), dtype=float)
 
     # ---- Call COSMIC Fortran kernel ----
-    # COSMIC ABI differs across cosmic-popsynth builds.
-    # Known variants:
-    #   4-return: (_, bpp_index, bcm_index, kick_info_arrays)
-    #   3-return: (bpp_index, bcm_index, kick_info_arrays)
-    #   3-return older fallback: (_, bpp_index, bcm_index), with kick_info filled in-place.
-    evolv2_args_24 = (
+    # COSMIC ABI differs across cosmic-popsynth builds.  COSMIC 4.1.0 uses
+    # (..., bhspin, tphys, zpars, kick_info_2x19) with no bkick argument;
+    # legacy builds use (..., bhspin, tphys, zpars, bkick, kick_info_2x18).
+    evolv2_args_cosmic410_24 = (
         kstar, mass, tb, e, metallicity, tphysf,
         dtp, mass0, rad, lumin, massc, radc,
         menv, renv, ospin, B_0, bacc, tacc, epoch, tms,
-        bhspin, tphys, zpars, bkick,
+        bhspin, tphys, zpars, kick_info,
     )
     evolv2_out, evolv2_call_convention = _call_evolv2_with_supported_abi(
-        _evolvebin, evolv2_args_24, kick_info
+        _evolvebin, evolv2_args_cosmic410_24, bkick, kick_info, evolv2_call_convention
     )
-    evolv2_return_length = len(evolv2_out)
-    global _EVOLV2_CALL_CONVENTION, _EVOLV2_RETURN_LENGTH
+    bpp_index, bcm_index, kick_info_arrays, evolv2_return_length = _parse_evolv2_return(
+        evolv2_out, evolv2_call_convention, kick_info
+    )
+    global _EVOLV2_CALL_CONVENTION, _EVOLV2_RETURN_LENGTH, _EVOLV2_KICK_INFO_SHAPE
     _EVOLV2_CALL_CONVENTION = evolv2_call_convention
     _EVOLV2_RETURN_LENGTH = evolv2_return_length
-
-    def _scalar_int(x, name):
-        arr = np.asarray(x)
-        if arr.shape == ():
-            return int(arr)
-        if arr.size == 1:
-            return int(arr.ravel()[0])
-        raise TypeError(
-            f"COSMIC returned non-scalar {name}: "
-            f"shape={arr.shape}, dtype={arr.dtype}"
-        )
-
-    if evolv2_return_length == 4:
-        _, bpp_index, bcm_index, kick_info_arrays = evolv2_out
-    elif evolv2_return_length == 3:
-        a, b, c = evolv2_out
-        # Most COSMIC 3.x builds return (bpp_index, bcm_index, kick_info_arrays).
-        # If that is not true, fall back to (_, bpp_index, bcm_index).
-        try:
-            bpp_index = _scalar_int(a, "bpp_index")
-            bcm_index = _scalar_int(b, "bcm_index")
-            kick_info_arrays = c
-        except TypeError:
-            _, bpp_index, bcm_index = evolv2_out
-            kick_info_arrays = kick_info
-    else:
-        raise RuntimeError(
-            f"Unexpected COSMIC evolv2 return length: {evolv2_return_length}"
-        )
-
-    bpp_index = _scalar_int(bpp_index, "bpp_index")
-    bcm_index = _scalar_int(bcm_index, "bcm_index")
+    _EVOLV2_KICK_INFO_SHAPE = tuple(kick_info.shape)
 
     # ---- Extract and clear output arrays (avoids Fortran global state leakage) ----
     bpp_raw = _evolvebin.binary.bpp[:25, :n_col_bpp].copy()
