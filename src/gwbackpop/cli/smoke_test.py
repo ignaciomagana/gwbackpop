@@ -52,6 +52,16 @@ def main() -> None:
     else:
         for module in COSMIC_MODULES:
             import_one(module)
+        from gwbackpop.evolution.cosmic import get_cosmic_capabilities
+
+        caps = get_cosmic_capabilities()
+        print("\nCOSMIC capabilities:")
+        print(f"  cosmic-popsynth version: {caps['cosmic_popsynth_version']}")
+        print(f"  cevars.alpha1 shape: {caps['cevars_alpha1_shape']}")
+        print(f"  mtvars.acc_lim shape: {caps['mtvars_acc_lim_shape']}")
+        print(f"  has se_flags: {caps['has_se_flags']}")
+        print(f"  evolv2 call convention: {caps['evolv2_call_convention'] or 'unknown until first call'}")
+        print(f"  evolv2 return convention: {caps['evolv2_return_convention'] or 'unknown until first call'}")
 
 
 if __name__ == "__main__":
