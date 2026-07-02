@@ -29,15 +29,14 @@
 #SBATCH --job-name=backpop_c410
 #SBATCH --output=/hildafs/projects/phy230054p/share/backpop_results/logs/backpop_c410_%A_%a.out
 #SBATCH --error=/hildafs/projects/phy230054p/share/backpop_results/logs/backpop_c410_%A_%a.err
-#SBATCH --array=0-8
+#SBATCH --array=0-50%10
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=24
 #SBATCH --mem=32G
-#SBATCH --time=48:00:00
-#SBATCH --partition=RM
+#SBATCH --time=64:00:00
+#SBATCH --partition=SIRIUS
 #SBATCH --account=phy230054p
 
-set -euo pipefail
 
 # ---------------------------------------------------------------------------
 # Paths / environment
@@ -75,20 +74,81 @@ SUPPORT_GATE="${SUPPORT_GATE:-none}"
 SUPPORT_HDI="${SUPPORT_HDI:-0.999}"
 
 # ---------------------------------------------------------------------------
-# Event list: exactly the 9 events currently present in your old results/
+# Clean GWTC-3 BBH event list
+# Ordered roughly by network SNR (high to low) within O1/O2/O3a/O3b.
+# Events excluded from default run listed at the bottom with reasons.
 # ---------------------------------------------------------------------------
 
 EVENTS=(
-    "GW150914"
-    "GW151226"
-    "GW170104"
-    "GW170608"
-    "GW170729"
-    "GW170809"
-    "GW170814"
-    "GW170818"
-    "GW170823"
+    # ---- O1 ----
+    "GW150914"          # reference; ~30+35 M_sun, high SNR
+    "GW151226"          # ~14+8 M_sun
+    # ---- O2 ----
+    "GW170104"          # ~31+20 M_sun
+    "GW170608"          # ~12+7 M_sun; lowest mass clean O2 BBH
+    "GW170729"          # ~51+34 M_sun; near-PISN but included — check posterior
+    "GW170809"          # ~35+24 M_sun
+    "GW170814"          # triple-detector; ~31+25 M_sun
+    "GW170818"          # ~36+27 M_sun
+    "GW170823"          # ~40+29 M_sun
+    # ---- O3a ----
+    "GW190408_181802"
+    "GW190412"          # asymmetric mass ratio; m1~30, m2~8
+    "GW190413_052954"
+    "GW190413_134308"
+    "GW190421_213856"
+    "GW190503_185404"
+    "GW190512_180714"
+    "GW190513_205428"
+    "GW190514_065416"
+    "GW190517_055101"
+    "GW190519_153544"
+    "GW190521_074359"   # near PISN boundary — expect poor COSMIC coverage
+    "GW190527_092055"
+    "GW190602_175927"
+    "GW190620_030421"
+    "GW190630_185205"
+    "GW190701_203306"
+    "GW190706_222641"
+    "GW190707_093326"
+    "GW190708_232457"
+    "GW190719_215514"
+    "GW190720_000836"
+    "GW190727_060333"
+    "GW190728_064510"
+    "GW190731_140936"
+    "GW190803_022701"
+    "GW190814"          # Lucky Strikes reference; NSBH / mass-gap secondary
+    "GW190828_063405"
+    "GW190828_065509"
+    "GW190910_112807"
+    "GW190915_235702"
+    "GW190924_021846"
+    "GW190929_012149"
+    # ---- O3b ----
+    "GW191105_143521"
+    "GW191109_010717"
+    "GW191129_134029"
+    "GW191204_171526"
+    "GW191215_223052"
+    "GW191222_033537"
+    "GW200202_154313"
+    "GW200225_060421"
+    "GW200311_115853"
 )
+# Excluded events (add back with care):
+#   GW190521         — primary > 85 M_sun, above PISN gap for COSMIC
+#   GW190425         — BNS, COSMIC kick stochasticity too high for Nautilus
+#   GW170817         — BNS, same reason
+#   GW190814_211741  — duplicate entry; GW190814 above is the correct ID
+
+N_EVENTS=${#EVENTS[@]}
+if [ "${SLURM_ARRAY_TASK_ID}" -ge "${N_EVENTS}" ]; then
+    echo "Task ${SLURM_ARRAY_TASK_ID} exceeds event list length ${N_EVENTS}. Exiting."
+    exit 0
+fi
+
+EVENT="${EVENTS[${SLURM_ARRAY_TASK_ID}]}"
 
 N_EVENTS=${#EVENTS[@]}
 if [ "${SLURM_ARRAY_TASK_ID}" -ge "${N_EVENTS}" ]; then
@@ -105,54 +165,20 @@ EVENT="${EVENTS[${SLURM_ARRAY_TASK_ID}]}"
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate "${CONDA_ENV}"
 
-cd "${CODE_DIR}"
-git rev-parse --short HEAD || true
-
-# Ensure editable install points at this checkout.
-python -m pip install -e . >/dev/null
-hash -r
-
 for cmd in gwbackpop-run-event gwbackpop-plot-event; do
     if ! command -v "${cmd}" >/dev/null 2>&1; then
         echo "ERROR: ${cmd} not found after activating ${CONDA_ENV}."
-        echo "Install/check env with: python -m pip install -e '.[cosmic]'"
+        echo "Install with: python -m pip install -e '.[cosmic]' or activate the correct environment."
         exit 1
     fi
 done
 
-# Preflight: confirm COSMIC 4.1 ABI is live.
-python - <<'PY'
-import importlib.metadata as im
-import numpy as np
-from cosmic import _evolvebin
-
-print("[preflight] cosmic-popsynth:", im.version("cosmic-popsynth"))
-print("[preflight] evolv2:", (_evolvebin.evolv2.__doc__ or "").splitlines()[0])
-print("[preflight] cevars.alpha1 shape:", np.asarray(_evolvebin.cevars.alpha1).shape)
-print("[preflight] mtvars.acc_lim shape:", np.asarray(_evolvebin.mtvars.acc_lim).shape)
-print("[preflight] has se_flags:", hasattr(_evolvebin, "se_flags"))
-
-assert np.asarray(_evolvebin.cevars.alpha1).shape == (2,)
-assert np.asarray(_evolvebin.mtvars.acc_lim).shape == (2,)
-assert hasattr(_evolvebin, "se_flags")
-PY
-
-# Now cd to run root workdir so gwbackpop-run-event writes into ./results,
-# which is symlinked to ${RESULTS_ROOT}.
-cd "${WORKDIR}"
-
 echo "============================================================"
-echo " Task:          ${SLURM_ARRAY_TASK_ID} / $((N_EVENTS-1))"
-echo " Event:         ${EVENT}"
-echo " Node:          $(hostname)"
-echo " CPUs:          ${SLURM_CPUS_PER_TASK}"
-echo " Env:           ${CONDA_ENV}"
-echo " Code dir:      ${CODE_DIR}"
-echo " Run root:      ${RUN_ROOT}"
-echo " Results root:  ${RESULTS_ROOT}"
-echo " Workdir:       ${WORKDIR}"
-echo " PE dir:        ${PE_DIR}"
-echo " Started:       $(date)"
+echo " Task:    ${SLURM_ARRAY_TASK_ID} / $((N_EVENTS-1))"
+echo " Event:   ${EVENT}"
+echo " Node:    $(hostname)"
+echo " CPUs:    ${SLURM_CPUS_PER_TASK}"
+echo " Started: $(date)"
 echo "============================================================"
 
 # ---------------------------------------------------------------------------
