@@ -89,7 +89,7 @@ if [ ! -f "${SAMPLES}" ]; then
     exit 1
 fi
 
-for cmd in gwbackpop-run-event gwbackpop-plot; do
+for cmd in gwbackpop-run-event gwbackpop-plot-event; do
     if ! command -v "${cmd}" >/dev/null 2>&1; then
         echo "ERROR: ${cmd} not found. Install the package with: python -m pip install -e '.[test]'"
         exit 1
@@ -178,7 +178,7 @@ echo ""
 echo "  Plotting 2D run (${DIR_2D})..."
 T3=$(date +%s)
 
-gwbackpop-plot \
+gwbackpop-plot-event \
     --results_dir  "${DIR_2D}" \
     --samples_path "${SAMPLES}" \
     --approximant  "${APPROXIMANT}" \
@@ -191,7 +191,7 @@ echo ""
 echo "  Plotting 3D run (${DIR_3D})..."
 T3b=$(date +%s)
 
-gwbackpop-plot \
+gwbackpop-plot-event \
     --results_dir  "${DIR_3D}" \
     --samples_path "${SAMPLES}" \
     --approximant  "${APPROXIMANT}" \
@@ -213,7 +213,7 @@ echo ""
 T4=$(date +%s)
 
 # Write comparison into the 2D directory so both share a common output
-gwbackpop-plot \
+gwbackpop-plot-event \
     --results_dir  "${DIR_2D}" \
     --compare_dir  "${DIR_3D}" \
     --samples_path "${SAMPLES}" \

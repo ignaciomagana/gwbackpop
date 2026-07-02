@@ -13,7 +13,7 @@ The repository currently contains three main workflows. The installed console co
 Additional utilities:
 
 - `gwbackpop-run-injections` builds COSMIC merger catalogs for selection corrections. It can either store a direct `P_det(m_1, m_2, z)` value from a pickled interpolator or store `pdet=nan` for the LVK/Farr workflow.
-- `gwbackpop-plot` makes diagnostic figures from single-event output directories.
+- `gwbackpop-plot-event` makes diagnostic figures from single-event output directories.
 - `gwbackpop-calibrate-snr-pdet` runs threshold-scan diagnostics for the semi-analytic SNR-proxy detection probability. It currently writes LVK/Farr comparison columns as `NaN`; those columns should be interpreted as placeholders until Farr calibration is implemented in this utility.
 - `workflows/shell/run_hierarchical_2d.sh`, `workflows/shell/run_hierarchical_3d.sh`, and `workflows/slurm/run_catalog_gwtc3.slurm` are convenience wrappers for catalog-scale analyses.
 
